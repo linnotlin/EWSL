@@ -1,5 +1,7 @@
 #include "ui.h"
 
+#include "lang.h"
+
 #include <objidl.h>
 #include <gdiplus.h>
 
@@ -185,7 +187,7 @@ static void springStep(double& x, double& v, double target,
     }
 }
 
-static inline int slotForBtn(int id)   { return (id >= 0 && id < 24) ? id : -1; }
+static inline int slotForBtn(int id)   { return (id >= 0 && id < 27) ? id : -1; }
 static inline int slotForNav(int idx)  { return (idx >= 0 && idx < 4) ? 24 + idx : -1; }
 static inline int slotForMenu(int idx) { return (idx >= 0 && idx < 16) ? 32 + idx : -1; }
 static inline int slotForTree(int idx) { return (idx >= 0 && idx < 16) ? 48 + idx : -1; }
@@ -998,7 +1000,10 @@ void Ui::layout(int w, int h, const UiModel& m, Geom& ge) const {
         }
     }
 
-    int setRowH = (int)(46 * s + 0.5);
+    // 40 rather than 46: the language row made it seven rows, and the shortcut
+    // list below is already sitting on the bottom edge of a default-height
+    // window. Seven at 40 lands within a few pixels of where six at 46 did.
+    int setRowH = (int)(40 * s + 0.5);
     int setTop = ge.body.t + (int)(18 * s + 0.5);
     int setListTop = setTop + (int)(34 * s + 0.5);
 
@@ -1008,7 +1013,7 @@ void Ui::layout(int w, int h, const UiModel& m, Geom& ge) const {
     int setRight = setLeft + setListW;
     int setGapX = (int)(22 * s + 0.5);
 
-    ge.setList = Box{ setLeft, setListTop, setRight, setListTop + 6 * setRowH };
+    ge.setList = Box{ setLeft, setListTop, setRight, setListTop + 7 * setRowH };
     ge.setSide = (setSideW > 0)
                      ? Box{ setRight + setGapX, setListTop,
                             setRight + setGapX + setSideW, ge.body.b }
@@ -1050,8 +1055,31 @@ void Ui::layout(int w, int h, const UiModel& m, Geom& ge) const {
     }
 
     {
-        int y0 = setListTop + 5 * setRowH + (setRowH - ctlH) / 2;
-        int w4 = (int)(96 * s + 0.5);
+        // Row 4 is the language selector. Three segments right-aligned like the
+        // theme row, sized for the widest label ("跟随系统" and "English") so the
+        // buttons do not change width when the language flips.
+        //
+        // 72 rather than 78: three segments reach further left than the theme
+        // row's pair, and at 78 the label column ran out of room -- English
+        // "Language" came out as "Langua...". 72 still clears 跟随系统 by ~26 px.
+        int y0 = setListTop + 4 * setRowH + (setRowH - ctlH) / 2;
+        int w5 = (int)(72 * s + 0.5);
+        int gap5 = (int)(6 * s + 0.5);
+        ge.setLangEn = Box{ setRight - (int)(14 * s + 0.5) - w5, y0,
+                            setRight - (int)(14 * s + 0.5), y0 + ctlH };
+        ge.setLangZh = Box{ ge.setLangEn.l - gap5 - w5, y0,
+                            ge.setLangEn.l - gap5, y0 + ctlH };
+        ge.setLangAuto = Box{ ge.setLangZh.l - gap5 - w5, y0,
+                              ge.setLangZh.l - gap5, y0 + ctlH };
+    }
+
+    {
+        int y0 = setListTop + 6 * setRowH + (setRowH - ctlH) / 2;
+        // 68 rather than 96: the two buttons have to leave room for the WSL
+        // version string in front of them. At 96 the version column came out
+        // 85 px wide in Chinese and rendered as a bare "W..." -- which reads as
+        // a bug rather than as a truncation. 68 still fits "修复 WSL"/"Re-check".
+        int w4 = (int)(68 * s + 0.5);
         int gap4 = (int)(8 * s + 0.5);
         ge.setRecheck = Box{ setRight - (int)(14 * s + 0.5) - w4, y0,
                              setRight - (int)(14 * s + 0.5), y0 + ctlH };
@@ -1277,7 +1305,8 @@ void Ui::paintTitleBar(HDC dc, int w, const UiModel& m, const Geom& ge) {
 void Ui::paintSidebar(HDC dc, int h, const UiModel& m, const Geom& ge) {
     double s = m_dpi / 96.0;
 
-    static const wchar_t* kNavTitle[4] = { L"终端", L"项目", L"发行版", L"设置" };
+    // Not static: the labels have to be re-resolved when the language changes.
+    const wchar_t* kNavTitle[4] = { LS(L"终端"), LS(L"项目"), LS(L"发行版"), LS(L"设置") };
 
     {
         Graphics g(dc);
@@ -1405,7 +1434,7 @@ void Ui::paintTermBar(HDC dc, int w, const UiModel& m, const Geom& ge) {
     std::wstring label;
     if (!m.activeDistro.empty()) label = m.activeDistro;
     else if (!m.installed.empty()) label = m.installed[0];
-    else label = m.wslMissing ? L"未检测到 WSL" : L"未安装发行版";
+    else label = m.wslMissing ? LS(L"未检测到 WSL") : LS(L"未安装发行版");
 
     if (ge.distroBtn.w() > 0) {
         int tx = ge.distroBtn.l + (int)(32 * s + 0.5);
@@ -1418,8 +1447,8 @@ void Ui::paintTermBar(HDC dc, int w, const UiModel& m, const Geom& ge) {
     }
 
     std::wstring right;
-    if (m.installing) right = L"正在安装…";
-    else if (m.loadingOnline) right = L"正在获取列表…";
+    if (m.installing) right = LS(L"正在安装…");
+    else if (m.loadingOnline) right = LS(L"正在获取列表…");
     if (!right.empty()) {
         int rx = ge.distroBtn.l - (int)(12 * s + 0.5);
         int rw = rx - (w / 2 + m_pad);
@@ -1489,12 +1518,12 @@ void Ui::paintDistroMenu(HDC dc, int w, int h, const UiModel& m, const Geom& ge)
     }
 
     if (ge.menuHdr1.w() > 0) {
-        textAt(dc, L"已安装", g_hSmall, kText2,
+        textAt(dc, LS(L"已安装"), g_hSmall, kText2,
                ge.menuHdr1.l + (int)(14 * s + 0.5), ge.menuHdr1.t,
                ge.menuHdr1.w() - (int)(20 * s), ge.menuHdr1.h(), 0);
     }
     if (ge.menuHdr2.w() > 0) {
-        textAt(dc, L"可安装", g_hSmall, kText2,
+        textAt(dc, LS(L"可安装"), g_hSmall, kText2,
                ge.menuHdr2.l + (int)(14 * s + 0.5), ge.menuHdr2.t,
                ge.menuHdr2.w() - (int)(20 * s), ge.menuHdr2.h(), 0);
     }
@@ -1511,16 +1540,16 @@ void Ui::paintDistroMenu(HDC dc, int w, int h, const UiModel& m, const Geom& ge)
         if (kind == 0) {
             if (idx >= (int)m.installed.size()) continue;
             name = m.installed[idx];
-            hint = L"启动";
+            hint = LS(L"启动");
         } else {
             if (idx >= (int)m.online.size()) continue;
             name = m.online[idx].label;
             if (name.empty()) name = m.online[idx].id;
             if (modelIsBroken(m, m.online[idx].id)) {
-                hint = L"重新安装";
+                hint = LS(L"重新安装");
                 hintColor = kDanger;
             } else {
-                hint = L"下载安装";
+                hint = LS(L"下载安装");
                 hintColor = kAccent;
             }
         }
@@ -1539,14 +1568,14 @@ void Ui::paintDistroMenu(HDC dc, int w, int h, const UiModel& m, const Geom& ge)
         int lo = ge.menuFirst + 1;
         int hi = ge.menuFirst + ge.menuShown;
         wchar_t buf[96];
-        wsprintfW(buf, L"%d–%d / %d  滚轮查看更多", lo, hi, ge.menuTotal);
+        wsprintfW(buf, LS(L"%d–%d / %d  滚轮查看更多"), lo, hi, ge.menuTotal);
         textAt(dc, buf, g_hSmall, kText2,
                ge.menuHint.l, ge.menuHint.t, ge.menuHint.w(), ge.menuHint.h(), 1);
     }
 
     if (ge.menuRows.empty()) {
-        std::wstring msg = m.loadingOnline ? L"正在获取发行版列表…"
-                                           : L"暂无可用发行版，请检查网络";
+        std::wstring msg = m.loadingOnline ? LS(L"正在获取发行版列表…")
+                                           : LS(L"暂无可用发行版，请检查网络");
         textAt(dc, msg, g_hSmall, kText2,
                ge.menuPanel.l + (int)(14 * s + 0.5), ge.menuPanel.t,
                ge.menuPanel.w() - (int)(28 * s + 0.5), ge.menuPanel.h(), 1);
@@ -1620,7 +1649,7 @@ void Ui::paintEmptyState(HDC dc, const UiModel& m, const Geom& ge) {
             Graphics g(dc);
             iconGear(g, (REAL)cx, (REAL)(cy - (int)(78 * s)), s * 1.6, kAccent, 2.2f);
         }
-        textAt(dc, L"正在检测 WSL 环境…", g_hBody, kText2,
+        textAt(dc, LS(L"正在检测 WSL 环境…"), g_hBody, kText2,
                B.l, cy - (int)(12 * s), B.w(), (int)(26 * s + 0.5), 1);
         return;
     }
@@ -1635,12 +1664,12 @@ void Ui::paintEmptyState(HDC dc, const UiModel& m, const Geom& ge) {
     int subY   = cy + (int)(16 * s + 0.5);
     int subH   = (int)(24 * s + 0.5);
 
-    std::wstring title = m.wslMissing ? L"未检测到 WSL" : L"尚未安装 Linux 发行版";
+    std::wstring title = m.wslMissing ? LS(L"未检测到 WSL") : LS(L"尚未安装 Linux 发行版");
     textAt(dc, title, g_hBig, kText, B.l, titleY, B.w(), titleH, 1);
 
     std::wstring sub = m.wslMissing
-        ? L"请先在「启用或关闭 Windows 功能」中勾选适用于 Linux 的 Windows 子系统"
-        : L"点击下方按钮，或使用上方发行版菜单选择下载";
+        ? LS(L"请先在「启用或关闭 Windows 功能」中勾选适用于 Linux 的 Windows 子系统")
+        : LS(L"点击下方按钮，或使用上方发行版菜单选择下载");
     textAt(dc, sub, g_hSmall, kText2, B.l, subY, B.w(), subH, 1);
 
     bool hv = (m_hoverBtn == 4);
@@ -1649,7 +1678,7 @@ void Ui::paintEmptyState(HDC dc, const UiModel& m, const Geom& ge) {
         fillRound(g, ge.emptyBtn.l, ge.emptyBtn.t, ge.emptyBtn.r, ge.emptyBtn.b,
                   ge.emptyBtn.h() / 2, hv ? kAccentDark : kAccent);
     }
-    textAt(dc, L"选择发行版安装", g_hBody, kWhite,
+    textAt(dc, LS(L"选择发行版安装"), g_hBody, kWhite,
            ge.emptyBtn.l, ge.emptyBtn.t, ge.emptyBtn.w(), ge.emptyBtn.h(), 1);
 }
 
@@ -1665,9 +1694,9 @@ void Ui::paintProjectEmpty(HDC dc, const UiModel& m, const Geom& ge) {
         iconFolder(g, (REAL)cx, (REAL)(cy - (int)(78 * s)), s * 2.2, kAccent, 2.2f);
     }
 
-    textAt(dc, L"打开一个文件夹开始", g_hBig, kText,
+    textAt(dc, LS(L"打开一个文件夹开始"), g_hBig, kText,
            B.l, cy - (int)(22 * s + 0.5), B.w(), (int)(32 * s + 0.5), 1);
-    textAt(dc, L"浏览目录结构，双击文件即可打开编辑（支持 cpp / mm / m / h 等高亮）",
+    textAt(dc, LS(L"浏览目录结构，双击文件即可打开编辑（支持 cpp / mm / m / h 等高亮）"),
            g_hSmall, kText2, B.l, cy + (int)(16 * s + 0.5), B.w(), (int)(24 * s + 0.5), 1);
 
     bool hv = (m_hoverBtn == 4);
@@ -1676,7 +1705,7 @@ void Ui::paintProjectEmpty(HDC dc, const UiModel& m, const Geom& ge) {
         fillRound(g, ge.emptyBtn.l, ge.emptyBtn.t, ge.emptyBtn.r, ge.emptyBtn.b,
                   ge.emptyBtn.h() / 2, hv ? kAccentDark : kAccent);
     }
-    textAt(dc, L"打开文件夹", g_hBody, kWhite,
+    textAt(dc, LS(L"打开文件夹"), g_hBody, kWhite,
            ge.emptyBtn.l, ge.emptyBtn.t, ge.emptyBtn.w(), ge.emptyBtn.h(), 1);
 }
 
@@ -1739,7 +1768,7 @@ void Ui::paintTree(HDC dc, const UiModel& m, const Geom& ge) {
            tl + m_pad, ge.body.t + (int)(8 * s + 0.5),
            m_treeW - m_pad - (int)(80 * s), (int)(36 * s + 0.5), 0);
 
-    textAt(dc, L"上级", g_hSmall, kAccent,
+    textAt(dc, LS(L"上级"), g_hSmall, kAccent,
            ge.treeUp.l, ge.treeUp.t, ge.treeUp.w(), ge.treeUp.h(), 1);
 
     for (size_t i = 0; i < ge.treeRows.size(); ++i) {
@@ -1766,10 +1795,14 @@ void Ui::paintSettings(HDC dc, const UiModel& m, const Geom& ge) {
     int setLeft = ge.setList.l;
     int setRight = ge.setList.r;
 
-    int rowH = (int)(46 * s + 0.5);
     int top = ge.body.t + (int)(18 * s + 0.5);
     int listTop = ge.setList.t;
-    const int kRows = 6;
+    const int kRows = 7;
+
+    // Derived from the box layout() handed over rather than recomputed from the
+    // same constant: the two used to be separate literals, and changing the row
+    // height in one place silently slid every label off its control.
+    int rowH = (ge.setList.b - ge.setList.t) / kRows;
 
     auto rowBox = [&](int row) {
         int y0 = listTop + row * rowH;
@@ -1829,6 +1862,10 @@ void Ui::paintSettings(HDC dc, const UiModel& m, const Geom& ge) {
         seg(ge.setTermPty,  m.terminalMode == 1, 18);
         seg(ge.setTermPipe, m.terminalMode == 2, 19);
 
+        seg(ge.setLangAuto, m.lang == 0, 24);
+        seg(ge.setLangZh,   m.lang == 1, 25);
+        seg(ge.setLangEn,   m.lang == 2, 26);
+
         seg(ge.setFix,     false, 20);
         seg(ge.setRecheck, false, 21);
 
@@ -1839,7 +1876,7 @@ void Ui::paintSettings(HDC dc, const UiModel& m, const Geom& ge) {
                         (REAL)(ge.setRecheck.w() - 1), (REAL)(ge.setRecheck.h() - 1));
     }
 
-    textAt(dc, L"设置", g_hBig, kText,
+    textAt(dc, LS(L"设置"), g_hBig, kText,
            setLeft, ge.body.t + (int)(16 * s + 0.5),
            setRight - setLeft, (int)(28 * s + 0.5), 0);
 
@@ -1848,12 +1885,13 @@ void Ui::paintSettings(HDC dc, const UiModel& m, const Geom& ge) {
         std::wstring label;
         std::wstring val;
 
-        if (i == 0)      { label = L"界面字号"; val = std::to_wstring(m.fontSize) + L" px"; }
-        else if (i == 1) { label = L"终端字号"; val = std::to_wstring(m.termFontSize) + L" px"; }
-        else if (i == 2) { label = L"界面主题"; }
-        else if (i == 3) { label = L"终端模式"; }
-        else if (i == 4) { label = L"WSL 位置"; }
-        else             { label = L"WSL 环境"; }
+        if (i == 0)      { label = LS(L"界面字号"); val = std::to_wstring(m.fontSize) + L" px"; }
+        else if (i == 1) { label = LS(L"终端字号"); val = std::to_wstring(m.termFontSize) + L" px"; }
+        else if (i == 2) { label = LS(L"界面主题"); }
+        else if (i == 3) { label = LS(L"终端模式"); }
+        else if (i == 4) { label = LS(L"界面语言"); }
+        else if (i == 5) { label = LS(L"WSL 位置"); }
+        else             { label = LS(L"WSL 环境"); }
 
         // 列表宽度跟着窗口走（窄的时候会和右侧说明栏平分），所以标签/数值这两栏
         // 也得按比例算，不能按 560 的固定宽度硬留。
@@ -1862,8 +1900,13 @@ void Ui::paintSettings(HDC dc, const UiModel& m, const Geom& ge) {
         if (ctlReserve > listW / 3) ctlReserve = listW / 3;
 
         int lw;
-        if (i >= 4) {
-            lw = (int)(170 * s + 0.5);
+        if (i >= 5) {
+            // The two WSL rows share a column, but sized to the longer label
+            // rather than a fixed 170: in English "WSL environment" ate the
+            // whole value column and the version came out as "W...".
+            int a1 = textWidth(dc, g_hBody, LS(L"WSL 位置"));
+            int a2 = textWidth(dc, g_hBody, LS(L"WSL 环境"));
+            lw = m_pad + (a1 > a2 ? a1 : a2) + (int)(14 * s + 0.5);
         } else if (i <= 1) {
             // 字号行右边要塞「数值 + 预览字形」，标签栏就只留标签自己够用的
             // 宽度；照 listW/2 分的话数值栏剩不到 160，预览字形永远放不下。
@@ -1875,6 +1918,19 @@ void Ui::paintSettings(HDC dc, const UiModel& m, const Geom& ge) {
             lw = listW - ctlReserve - (int)(60 * s + 0.5);
         }
         if (lw < (int)(60 * s + 0.5)) lw = (int)(60 * s + 0.5);
+
+        // Rows with segmented controls have to stop short of the first pill.
+        // Labels are painted after the pills, so in a narrow window -- where the
+        // language row's three segments reach much further left than the
+        // two-segment rows -- the label ended up drawn on top of its own control.
+        if (i == 2 || i == 3 || i == 4) {
+            const Box& first = (i == 2) ? ge.setLight
+                             : (i == 3) ? ge.setTermAuto
+                                        : ge.setLangAuto;
+            int cap = first.l - setLeft - m_pad - (int)(10 * s + 0.5);
+            if (lw > cap) lw = cap;
+        }
+
         textAt(dc, label, g_hBody, kText, setLeft + m_pad, rb.t, lw, rb.h(), 0);
 
         int vx = setLeft + lw;
@@ -1918,50 +1974,75 @@ void Ui::paintSettings(HDC dc, const UiModel& m, const Geom& ge) {
             textAt(dc, val, g_hBody, kText2, vx, rb.t, vw, rb.h(), 2);
         }
 
-        if (i == 4) {
-            std::wstring p = m.wslPath.empty() ? L"未检测到" : m.wslPath;
+        if (i == 5) {
+            std::wstring p = m.wslPath.empty() ? LS(L"未检测到") : m.wslPath;
             int x = setLeft + m_pad + lw;
             textAt(dc, p, g_hSmall, kText2,
                    x, rb.t, setRight - m_pad - x, rb.h(), 2);
-        } else if (i == 5) {
-            std::wstring v = m.wslVersion.empty() ? L"未检测到 WSL" : m.wslVersion;
+        } else if (i == 6) {
+            // `wsl --version` prints "WSL 版本: 2.6.1.0" on a Chinese system and
+            // "WSL version: 2.6.1.0" on an English one -- the prefix is localised
+            // by wsl.exe itself, so there is no string here to translate. The row
+            // label already says what the number is; keep only the number, which
+            // also stops it from eliding against the buttons.
+            std::wstring v = m.wslVersion.empty() ? LS(L"未检测到 WSL") : m.wslVersion;
+            size_t c = v.find(L':');
+            if (c == std::wstring::npos) c = v.find(L'：');
+            if (c != std::wstring::npos) {
+                size_t s0 = c + 1;
+                while (s0 < v.size() && v[s0] == L' ') ++s0;
+                if (s0 < v.size()) v = v.substr(s0);
+            }
+
             int x = setLeft + m_pad + lw;
             int rr = ge.setFix.l - (int)(10 * s + 0.5);
             if (rr < x + 40) rr = x + 40;
-            textAt(dc, v, g_hSmall, kText2, x, rb.t, rr - x, rb.h(), 2);
+            // Draw it only when the whole thing fits. DT_END_ELLIPSIS would
+            // otherwise chop it down to a bare "W...", which reads as a broken
+            // control rather than as a truncation; an empty cell reads fine.
+            int avail = rr - x;
+            if (textWidth(dc, g_hSmall, v) <= avail)
+                textAt(dc, v, g_hSmall, kText2, x, rb.t, avail, rb.h(), 2);
         }
     }
 
-    textAt(dc, L"浅色", g_hSmall, (m.theme == 0) ? kWhite : kText2,
+    textAt(dc, LS(L"浅色"), g_hSmall, (m.theme == 0) ? kWhite : kText2,
            ge.setLight.l, ge.setLight.t, ge.setLight.w(), ge.setLight.h(), 1);
-    textAt(dc, L"深色", g_hSmall, (m.theme == 1) ? kWhite : kText2,
+    textAt(dc, LS(L"深色"), g_hSmall, (m.theme == 1) ? kWhite : kText2,
            ge.setDark.l, ge.setDark.t, ge.setDark.w(), ge.setDark.h(), 1);
 
-    textAt(dc, L"自动",   g_hSmall, (m.terminalMode == 0) ? kWhite : kText2,
+    textAt(dc, LS(L"自动"),   g_hSmall, (m.terminalMode == 0) ? kWhite : kText2,
            ge.setTermAuto.l, ge.setTermAuto.t, ge.setTermAuto.w(), ge.setTermAuto.h(), 1);
     textAt(dc, L"PTY", g_hSmall, (m.terminalMode == 1) ? kWhite : kText2,
            ge.setTermPty.l, ge.setTermPty.t, ge.setTermPty.w(), ge.setTermPty.h(), 1);
-    textAt(dc, L"兼容",   g_hSmall, (m.terminalMode == 2) ? kWhite : kText2,
+    textAt(dc, LS(L"兼容"),   g_hSmall, (m.terminalMode == 2) ? kWhite : kText2,
            ge.setTermPipe.l, ge.setTermPipe.t, ge.setTermPipe.w(), ge.setTermPipe.h(), 1);
 
-    textAt(dc, L"修复 WSL", g_hSmall, kAccent,
+    textAt(dc, LS(L"跟随系统"), g_hSmall, (m.lang == 0) ? kWhite : kText2,
+           ge.setLangAuto.l, ge.setLangAuto.t, ge.setLangAuto.w(), ge.setLangAuto.h(), 1);
+    textAt(dc, LS(L"中文"), g_hSmall, (m.lang == 1) ? kWhite : kText2,
+           ge.setLangZh.l, ge.setLangZh.t, ge.setLangZh.w(), ge.setLangZh.h(), 1);
+    textAt(dc, L"English", g_hSmall, (m.lang == 2) ? kWhite : kText2,
+           ge.setLangEn.l, ge.setLangEn.t, ge.setLangEn.w(), ge.setLangEn.h(), 1);
+
+    textAt(dc, LS(L"修复 WSL"), g_hSmall, kAccent,
            ge.setFix.l, ge.setFix.t, ge.setFix.w(), ge.setFix.h(), 1);
-    textAt(dc, L"重新检测", g_hSmall, kAccent,
+    textAt(dc, LS(L"重新检测"), g_hSmall, kAccent,
            ge.setRecheck.l, ge.setRecheck.t, ge.setRecheck.w(), ge.setRecheck.h(), 1);
 
     int infoT = listTop + kRows * rowH + (int)(18 * s + 0.5);
-    textAt(dc, L"快捷键", g_hBold, kText,
+    textAt(dc, LS(L"快捷键"), g_hBold, kText,
            setLeft, infoT, setRight - setLeft, (int)(22 * s + 0.5), 0);
 
     struct KeyRow { const wchar_t* k; const wchar_t* d; };
     static const KeyRow keys[] = {
-        { L"Ctrl + S",         L"保存当前文件（项目页）" },
-        { L"Ctrl + 滚轮",      L"缩放字体大小" },
-        { L"Ctrl + Shift + C", L"复制终端选区" },
-        { L"Ctrl + Shift + V", L"粘贴到终端" },
-        { L"Ctrl + A",         L"编辑器全选" },
-        { L"Ctrl + L / Ctrl+C", L"清屏 / 中断当前命令" },
-        { L"Esc",              L"关闭发行版下拉菜单" }
+        { L"Ctrl + S",         LS(L"保存当前文件（项目页）") },
+        { LS(L"Ctrl + 滚轮"),      LS(L"缩放字体大小") },
+        { L"Ctrl + Shift + C", LS(L"复制终端选区") },
+        { L"Ctrl + Shift + V", LS(L"粘贴到终端") },
+        { L"Ctrl + A",         LS(L"编辑器全选") },
+        { L"Ctrl + L / Ctrl+C", LS(L"清屏 / 中断当前命令") },
+        { L"Esc",              LS(L"关闭发行版下拉菜单") }
     };
 
     int keyW = (int)(176 * s + 0.5);
@@ -2003,13 +2084,13 @@ void Ui::paintSettings(HDC dc, const UiModel& m, const Geom& ge) {
         }
 
         int cy = ny + cardPad;
-        textAt(dc, L"Arch Linux 密钥初始化", g_hBold, kText,
+        textAt(dc, LS(L"Arch Linux 密钥初始化"), g_hBold, kText,
                nx + cardPad, cy, nw - cardPad * 2, cardTitleH, 0);
         cy += cardTitleH;
-        textAt(dc, L"首次使用请先初始化密钥环，", g_hSmall, kText2,
+        textAt(dc, LS(L"首次使用请先初始化密钥环，"), g_hSmall, kText2,
                nx + cardPad, cy, nw - cardPad * 2, subH, 0);
         cy += subH;
-        textAt(dc, L"否则 pacman 装不了软件。", g_hSmall, kText2,
+        textAt(dc, LS(L"否则 pacman 装不了软件。"), g_hSmall, kText2,
                nx + cardPad, cy, nw - cardPad * 2, subH, 0);
         cy += subH + codeGap;
 
@@ -2059,7 +2140,7 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
                                : mixColor(kCard, kAccentSoft, hb));
         strokeRound(g, ge.dRefresh.l, ge.dRefresh.t, ge.dRefresh.r, ge.dRefresh.b,
                     (int)(10 * s), kPanelLine, 1.0f);
-        textAt(dc, m.distroBusy ? L"读取中" : L"刷新",
+        textAt(dc, m.distroBusy ? LS(L"读取中") : LS(L"刷新"),
                m.distroBusy ? g_hSmall : g_hBody,
                m.distroBusy ? kText2 : kAccent,
                ge.dRefresh.l, ge.dRefresh.t, ge.dRefresh.w(), ge.dRefresh.h(), 1);
@@ -2067,7 +2148,7 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
 
     int titleW = ge.dRefresh.w() > 0 ? (ge.dRefresh.l - ge.body.l - (int)(16 * s + 0.5))
                                      : (ge.body.w() - (int)(40 * s + 0.5));
-    textAt(dc, m.distroMsg.empty() ? L"发行版" : m.distroMsg, g_hBold, kText,
+    textAt(dc, m.distroMsg.empty() ? LS(L"发行版") : m.distroMsg, g_hBold, kText,
            ge.body.l + (int)(20 * s + 0.5), ge.body.t + (int)(10 * s + 0.5),
            titleW, (int)(30 * s + 0.5), 0);
 
@@ -2079,7 +2160,7 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
             g.SetClip(clip, CombineModeReplace);
 
         if (ge.dHdrInst.w() > 0) {
-            textAt(dc, L"已安装", g_hSmall, kText2,
+            textAt(dc, LS(L"已安装"), g_hSmall, kText2,
                    ge.dHdrInst.l, ge.dHdrInst.t, ge.dHdrInst.w(), ge.dHdrInst.h(), 0);
         }
 
@@ -2133,12 +2214,12 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
                           mixColor(kOk, kWhite, 0.9));
                 strokeRound(g, badX, badY, badX + badW, badY + badH, (int)(7 * s + 0.5),
                             mixColor(kOk, kWhite, 0.5), 1.0f);
-                textAt(dc, L"运行中", g_hSmall, mixColor(kOk, kText, 0.25),
+                textAt(dc, LS(L"运行中"), g_hSmall, mixColor(kOk, kText, 0.25),
                        badX, badY, badW, badH, 1);
             } else {
                 fillRound(g, badX, badY, badX + badW, badY + badH, (int)(7 * s + 0.5),
                           mixColor(kText3, kWhite, 0.78));
-                textAt(dc, L"已停止", g_hSmall, mixColor(kText2, kWhite, 0.35),
+                textAt(dc, LS(L"已停止"), g_hSmall, mixColor(kText2, kWhite, 0.35),
                        badX, badY, badW, badH, 1);
             }
 
@@ -2152,14 +2233,14 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
 
             fillRound(g, rx - bw, by, rx, by + bh, (int)(8 * s),
                       isActive ? mixColor(kAccent, kAccentDark, 0.35) : kHoverBtn);
-            textAt(dc, isActive ? L"已连接" : L"连接", g_hSmall,
+            textAt(dc, isActive ? LS(L"已连接") : LS(L"连接"), g_hSmall,
                    isActive ? kWhite : kText,
                    rx - bw, by, bw, bh, 1);
             rx -= bw + (int)(6 * s + 0.5);
 
             fillRound(g, rx - bw, by, rx, by + bh, (int)(8 * s), kHoverBtn);
             strokeRound(g, rx - bw, by, rx, by + bh, (int)(8 * s), kPanelLine, 1.0f);
-            textAt(dc, isDef ? L"默认" : L"设为默认", g_hSmall,
+            textAt(dc, isDef ? LS(L"默认") : LS(L"设为默认"), g_hSmall,
                    isDef ? kAccent : kText2,
                    rx - bw, by, bw, bh, 1);
             rx -= bw + (int)(6 * s + 0.5);
@@ -2168,7 +2249,7 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
             fillRound(g, rx - bw, by, rx, by + bh, (int)(8 * s),
                       busyDel ? mixColor(kHoverBtn, kText3, 0.55) : kHoverBtn);
             strokeRound(g, rx - bw, by, rx, by + bh, (int)(8 * s), kPanelLine, 1.0f);
-            textAt(dc, busyDel ? L"注销中" : L"删除", g_hSmall,
+            textAt(dc, busyDel ? LS(L"注销中") : LS(L"删除"), g_hSmall,
                    busyDel ? kText3 : kDanger, rx - bw, by, bw, bh, 1);
 
             textAt(dc, name, g_hBody, mixColor(kText, kWhite, rowHv * 0.12),
@@ -2176,7 +2257,7 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
         }
 
         if (ge.dHdrOnline.w() > 0) {
-            textAt(dc, L"可安装", g_hSmall, kText2,
+            textAt(dc, LS(L"可安装"), g_hSmall, kText2,
                    ge.dHdrOnline.l, ge.dHdrOnline.t, ge.dHdrOnline.w(),
                    ge.dHdrOnline.h(), 0);
             Pen sep(kSep, 1.0f);
@@ -2226,7 +2307,7 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
 
             fillRound(g, bx, by, bx + bw, by + bh, (int)(8 * s),
                       mixColor(broken ? kDanger : kAccent, kWhite, 0.12));
-            textAt(dc, broken ? L"重新安装" : L"下载安装", g_hSmall, kWhite,
+            textAt(dc, broken ? LS(L"重新安装") : LS(L"下载安装"), g_hSmall, kWhite,
                    bx, by, bw, bh, 1);
 
             if (broken) {
@@ -2236,7 +2317,7 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
         }
 
         if (m.distroLoading && m.installed.empty() && m.online.empty()) {
-            textAt(dc, L"正在读取发行版列表…", g_hBody, kText2,
+            textAt(dc, LS(L"正在读取发行版列表…"), g_hBody, kText2,
                    ge.body.l, ge.body.t + (int)(120 * s + 0.5), ge.body.w(),
                    (int)(28 * s + 0.5), 1);
         }
@@ -2249,11 +2330,11 @@ void Ui::paintDistroPage(HDC dc, const UiModel& m, const Geom& ge) {
         std::wstring t;
         if (ge.dTotal > 0) {
             wchar_t buf[128];
-            wsprintfW(buf, L"共 %d 项 · 已安装 %d · 可安装 %d",
+            wsprintfW(buf, LS(L"共 %d 项 · 已安装 %d · 可安装 %d"),
                       ge.dTotal, (int)m.installed.size(), (int)m.online.size());
             t = buf;
         }
-        if (t.empty()) t = L"读取不到发行版列表，试试右上角刷新";
+        if (t.empty()) t = LS(L"读取不到发行版列表，试试右上角刷新");
         textAt(dc, t, g_hSmall, kText2, ge.dHint.l, ge.dHint.t, ge.dHint.w(),
                ge.dHint.h(), 1);
     }
@@ -2267,15 +2348,15 @@ void Ui::paintInstall(HDC dc, const UiModel& m, const Geom& ge) {
     if (cardR > cardL + (int)(640 * s)) cardR = cardL + (int)(640 * s);
     int cardW = cardR - cardL;
 
-    std::wstring title = L"安装 " + (m.instName.empty() ? std::wstring(L"发行版") : m.instName);
+    std::wstring title = LS(L"安装 ") + (m.instName.empty() ? std::wstring(LS(L"发行版")) : m.instName);
     textAt(dc, title, g_hBig, kText, cardL, ge.body.t + (int)(14 * s + 0.5),
            cardW, (int)(30 * s + 0.5), 0);
 
     static const wchar_t* kSteps[] = {
-        L"1  解析镜像地址",
-        L"2  下载镜像",
-        L"3  导入 WSL",
-        L"4  注册并启动"
+        LS(L"1  解析镜像地址"),
+        LS(L"2  下载镜像"),
+        LS(L"3  导入 WSL"),
+        LS(L"4  注册并启动")
     };
 
     int stageRow = (int)(30 * s + 0.5);
@@ -2327,8 +2408,8 @@ void Ui::paintInstall(HDC dc, const UiModel& m, const Geom& ge) {
         }
 
         std::wstring mark;
-        if (done)        mark = L"完成";
-        else if (active) mark = L"进行中";
+        if (done)        mark = LS(L"完成");
+        else if (active) mark = LS(L"进行中");
         Color mc = done ? kOk : (active ? kAccent : kText3);
         textAt(dc, mark, g_hSmall, mc,
                cardR - (int)(100 * s), y, (int)(100 * s), stageRow, 2);
@@ -2413,7 +2494,7 @@ void Ui::paintInstall(HDC dc, const UiModel& m, const Geom& ge) {
     }
 
     if (m.instLog.empty()) {
-        textAt(dc, L"（等待输出…）", g_hSmall, Color(255, 0x7A, 0x7A, 0x86),
+        textAt(dc, LS(L"（等待输出…）"), g_hSmall, Color(255, 0x7A, 0x7A, 0x86),
                ge.instLog.l + pad, ge.instLog.t + pad,
                ge.instLog.w() - pad * 2, lineH, 0);
     }
@@ -2426,14 +2507,14 @@ void Ui::paintInstall(HDC dc, const UiModel& m, const Geom& ge) {
         double hv = hoverOf(slotForBtn(22));
         fillRound(g, ge.instCancel.l, ge.instCancel.t, ge.instCancel.r, ge.instCancel.b,
                   (int)(9 * s), mixColor(kHoverBtn, kHoverSel, hv));
-        textAt(dc, L"取消", g_hBody, kText,
+        textAt(dc, LS(L"取消"), g_hBody, kText,
                ge.instCancel.l, ge.instCancel.t, ge.instCancel.w(), ge.instCancel.h(), 1);
     } else if (!busy && m.instStage != INST_IDLE) {
         Graphics g(dc);
         double hv = hoverOf(slotForBtn(23));
         fillRound(g, ge.instRetry.l, ge.instRetry.t, ge.instRetry.r, ge.instRetry.b,
                   (int)(9 * s), mixColor(kHoverBtn, kHoverSel, hv));
-        textAt(dc, L"重试", g_hBody, kText,
+        textAt(dc, LS(L"重试"), g_hBody, kText,
                ge.instRetry.l, ge.instRetry.t, ge.instRetry.w(), ge.instRetry.h(), 1);
     }
 
@@ -2442,7 +2523,7 @@ void Ui::paintInstall(HDC dc, const UiModel& m, const Geom& ge) {
         if (busy) {
             fillRound(g, ge.instClose.l, ge.instClose.t, ge.instClose.r, ge.instClose.b,
                       (int)(9 * s), mixColor(kHoverBtn, kText3, 0.35));
-            textAt(dc, L"安装中…", g_hBody, kText2,
+            textAt(dc, LS(L"安装中…"), g_hBody, kText2,
                    ge.instClose.l, ge.instClose.t, ge.instClose.w(), ge.instClose.h(), 1);
         } else {
             double hv = hoverOf(slotForBtn(10));
@@ -2451,7 +2532,7 @@ void Ui::paintInstall(HDC dc, const UiModel& m, const Geom& ge) {
                       (int)(9 * s),
                       mixColor(mixColor(kAccent, kAccentDark, hv * 0.30), kAccentDark,
                                pr * 0.5));
-            textAt(dc, m.instStage == INST_DONE ? L"进入终端" : L"返回", g_hBody, kWhite,
+            textAt(dc, m.instStage == INST_DONE ? LS(L"进入终端") : LS(L"返回"), g_hBody, kWhite,
                    ge.instClose.l, ge.instClose.t, ge.instClose.w(), ge.instClose.h(), 1);
         }
     }
@@ -2542,7 +2623,7 @@ void Ui::paintEditorGdi(HDC dc, const UiModel& m, const Editor* ed,
 
     {
         Color tFg = (m.theme == 1) ? Color(255, 0xE8, 0xE8, 0xEA) : kText;
-        std::wstring name = m.editorName.empty() ? L"未命名" : m.editorName;
+        std::wstring name = m.editorName.empty() ? LS(L"未命名") : m.editorName;
 
         textAt(dc, name, g_hBody, tFg,
                L.l + m_pad, L.t, L.r - L.l - (int)(230 * s), L.toolH, 0);
@@ -2552,9 +2633,9 @@ void Ui::paintEditorGdi(HDC dc, const UiModel& m, const Editor* ed,
         textAt(dc, meta, g_hSmall, kText2,
                L.l + m_pad + (int)(160 * s), L.t, L.r - L.l - (int)(390 * s), L.toolH, 0);
 
-        textAt(dc, L"新建", g_hSmall, tFg, ge.edNew.l, ge.edNew.t, ge.edNew.w(), ge.edNew.h(), 1);
-        textAt(dc, L"保存", g_hSmall, kWhite, ge.edSave.l, ge.edSave.t, ge.edSave.w(), ge.edSave.h(), 1);
-        textAt(dc, L"关闭", g_hSmall, tFg, ge.edClose.l, ge.edClose.t, ge.edClose.w(), ge.edClose.h(), 1);
+        textAt(dc, LS(L"新建"), g_hSmall, tFg, ge.edNew.l, ge.edNew.t, ge.edNew.w(), ge.edNew.h(), 1);
+        textAt(dc, LS(L"保存"), g_hSmall, kWhite, ge.edSave.l, ge.edSave.t, ge.edSave.w(), ge.edSave.h(), 1);
+        textAt(dc, LS(L"关闭"), g_hSmall, tFg, ge.edClose.l, ge.edClose.t, ge.edClose.w(), ge.edClose.h(), 1);
     }
 
     int bodyT = L.t + L.toolH;
@@ -2742,7 +2823,7 @@ void Ui::paintContent(HDC dc, int w, int h, const UiModel& m,
             paintEditorGdi(dc, m, ed, ge, caretOn);
         } else {
             int cy = (ge.ed.t + ge.ed.b) / 2;
-            textAt(dc, L"从右侧目录树选择一个文件打开", g_hBody, kText2,
+            textAt(dc, LS(L"从右侧目录树选择一个文件打开"), g_hBody, kText2,
                    ge.ed.l, cy - 12, ge.ed.r - ge.ed.l, 24, 1);
         }
     }
@@ -2852,6 +2933,9 @@ UiClick Ui::hitTest(int w, int h, int x, int y, const UiModel& m) {
         else if (ge.setTermAuto.has(x, y)) c.action = UI_SET_TERM_AUTO;
         else if (ge.setTermPty.has(x, y)) c.action = UI_SET_TERM_PTY;
         else if (ge.setTermPipe.has(x, y)) c.action = UI_SET_TERM_PIPE;
+        else if (ge.setLangAuto.has(x, y)) c.action = UI_SET_LANG_AUTO;
+        else if (ge.setLangZh.has(x, y)) c.action = UI_SET_LANG_ZH;
+        else if (ge.setLangEn.has(x, y)) c.action = UI_SET_LANG_EN;
         else if (ge.setFix.has(x, y)) c.action = UI_FIX_WSL;
         else if (ge.setRecheck.has(x, y)) c.action = UI_RECHECK;
         return c;
@@ -3009,6 +3093,9 @@ bool Ui::updateHover(int w, int h, int x, int y, const UiModel& m) {
                 else if (ge.setTermAuto.has(x, y)) btn = 17;
                 else if (ge.setTermPty.has(x, y)) btn = 18;
                 else if (ge.setTermPipe.has(x, y)) btn = 19;
+                else if (ge.setLangAuto.has(x, y)) btn = 24;
+                else if (ge.setLangZh.has(x, y)) btn = 25;
+                else if (ge.setLangEn.has(x, y)) btn = 26;
                 else if (ge.setFix.has(x, y)) btn = 20;
                 else if (ge.setRecheck.has(x, y)) btn = 21;
             } else if (m.page == PAGE_INSTALL) {

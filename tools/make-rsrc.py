@@ -36,7 +36,7 @@ def dib_bytes(im):
     return bytes(hdr) + bytes(xor) + andmask
 
 
-def build_ico(raw, sizes=SIZES):
+def build_ico(raw, sizes=SIZES, force_dib=False):
     """Return the raw bytes of a standard .ico file.
 
     256px is stored as PNG (lossless); every smaller size is a 32bpp DIB with
@@ -51,7 +51,7 @@ def build_ico(raw, sizes=SIZES):
         f = im.resize((s, s), Image.LANCZOS)
         pct = 180 if s <= 32 else (120 if s <= 64 else 80)
         f = f.filter(ImageFilter.UnsharpMask(radius=1.2, percent=pct, threshold=2))
-        if s >= 256:
+        if s >= 256 and not force_dib:
             b = io.BytesIO()
             f.save(b, 'PNG', optimize=True)
             data = b.getvalue()
@@ -96,9 +96,22 @@ def build_group(images):
     resource *id* (1..n) -- NOT a byte offset into embedded data. The actual
     image bytes live in the separate RT_ICON resources, so the group carries no
     image payload of its own.
+
+    Entries are written smallest-first on purpose. LookupIconIdFromDirectoryEx
+    walks the directory and hands back the first entry that is at least as
+    large as the request; with the biggest frame listed first (which is what a
+    plain .ico normally does) every request -- 16px taskbar, 32px Alt+Tab --
+    resolves to the 256px PNG, and scaling that down through
+    CreateIconFromResourceEx yields garbage: only the top sliver of the artwork
+    survives and the rest of the icon comes out blank. Ascending order makes
+    each request land on its exact frame.
+
+    The RT_ICON ids stay tied to the original (largest-first) index so the ids
+    written here keep matching the resources emitted by main().
     """
     out = bytearray(struct.pack('<HHH', 0, 1, len(images)))
-    for i, (size, payload) in enumerate(images):
+    for i in sorted(range(len(images)), key=lambda k: images[k][0]):
+        size, payload = images[i]
         sz = 0 if size >= 256 else size  # 0 means 256 in an ICONDIRENTRY
         # PIL stores PNG images with planes=0/bpp=0 and DIBs with planes=1/bpp=32;
         # mirror the original entry's planes/bpp so the loader decodes correctly.

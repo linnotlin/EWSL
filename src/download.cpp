@@ -12,6 +12,8 @@
 
 #include "download.h"
 
+#include "lang.h"
+
 namespace wslterm {
 
 namespace {
@@ -47,16 +49,16 @@ bool crack(const std::wstring& url, UrlParts& out) {
 std::wstring winErr(const wchar_t* what) {
     DWORD e = GetLastError();
     wchar_t buf[320];
-    swprintf(buf, 320, L"%s 失败（错误码 %lu）", what, (unsigned long)e);
+    swprintf(buf, 320, LS(L"%s 失败（错误码 %lu）"), what, (unsigned long)e);
 
     std::wstring s = buf;
 
     switch (e) {
-    case 12007: s += L"；域名解析失败，检查网络或代理"; break;
-    case 12029: s += L"；无法连接到下载服务器"; break;
-    case 12002: s += L"；连接超时，稍后重试"; break;
-    case 12037: s += L"；服务器证书无效"; break;
-    case 12019: s += L"；网络不可用"; break;
+    case 12007: s += LS(L"；域名解析失败，检查网络或代理"); break;
+    case 12029: s += LS(L"；无法连接到下载服务器"); break;
+    case 12002: s += LS(L"；连接超时，稍后重试"); break;
+    case 12037: s += LS(L"；服务器证书无效"); break;
+    case 12019: s += LS(L"；网络不可用"); break;
     default: break;
     }
     return s;
@@ -124,7 +126,7 @@ bool httpDownload(const std::wstring& url,
                   volatile long* cancel) {
     UrlParts up;
     if (!crack(url, up)) {
-        err = L"无法解析下载地址：" + url;
+        err = LS(L"无法解析下载地址：") + url;
         return false;
     }
 
@@ -133,7 +135,7 @@ bool httpDownload(const std::wstring& url,
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) {
-        err = winErr(L"初始化 WinHTTP");
+        err = winErr(LS(L"初始化 WinHTTP"));
         return false;
     }
 
@@ -150,13 +152,13 @@ bool httpDownload(const std::wstring& url,
 
     do {
         hConn = WinHttpConnect(hSession, up.host.c_str(), up.port, 0);
-        if (!hConn) { err = winErr(L"连接下载服务器"); break; }
+        if (!hConn) { err = winErr(LS(L"连接下载服务器")); break; }
 
         DWORD flags = up.secure ? WINHTTP_FLAG_SECURE : 0;
         hReq = WinHttpOpenRequest(hConn, L"GET", up.path.c_str(),
                                   NULL, WINHTTP_NO_REFERER,
                                   WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-        if (!hReq) { err = winErr(L"创建 HTTP 请求"); break; }
+        if (!hReq) { err = winErr(LS(L"创建 HTTP 请求")); break; }
 
         DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
         WinHttpSetOption(hReq, WINHTTP_OPTION_REDIRECT_POLICY,
@@ -164,10 +166,10 @@ bool httpDownload(const std::wstring& url,
 
         if (!WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-            err = winErr(L"发送 HTTP 请求");
+            err = winErr(LS(L"发送 HTTP 请求"));
             break;
         }
-        if (!WinHttpReceiveResponse(hReq, NULL)) { err = winErr(L"读取 HTTP 响应"); break; }
+        if (!WinHttpReceiveResponse(hReq, NULL)) { err = winErr(LS(L"读取 HTTP 响应")); break; }
 
         DWORD status = 0;
         DWORD slen = sizeof(status);
@@ -176,7 +178,7 @@ bool httpDownload(const std::wstring& url,
                             WINHTTP_NO_HEADER_INDEX);
         if (status != 200) {
             wchar_t buf[160];
-            wsprintfW(buf, L"服务器返回 HTTP %lu", (unsigned long)status);
+            wsprintfW(buf, LS(L"服务器返回 HTTP %lu"), (unsigned long)status);
             err = buf;
             break;
         }
@@ -196,7 +198,7 @@ bool httpDownload(const std::wstring& url,
         hFile = CreateFileW(destPath.c_str(), GENERIC_WRITE, 0, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) {
-            err = winErr(L"创建本地文件");
+            err = winErr(LS(L"创建本地文件"));
             break;
         }
 
@@ -207,20 +209,20 @@ bool httpDownload(const std::wstring& url,
 
         for (;;) {
             if (cancel && InterlockedCompareExchange(cancel, 0, 0) != 0) {
-                err = L"已取消";
+                err = LS(L"已取消");
                 break;
             }
 
             DWORD n = 0;
             if (!WinHttpReadData(hReq, buf, (DWORD)sizeof(buf), &n)) {
-                err = winErr(L"读取数据");
+                err = winErr(LS(L"读取数据"));
                 break;
             }
             if (n == 0) { ok = true; break; }
 
             DWORD w = 0;
             if (!WriteFile(hFile, buf, n, &w, NULL) || w != n) {
-                err = L"写入磁盘失败（空间不足？）";
+                err = LS(L"写入磁盘失败（空间不足？）");
                 break;
             }
 
@@ -242,7 +244,7 @@ bool httpDownload(const std::wstring& url,
                 tickBase = now;
                 speedBase = got;
 
-                if (!tick(user, p)) { err = L"已取消"; break; }
+                if (!tick(user, p)) { err = LS(L"已取消"); break; }
             }
         }
 

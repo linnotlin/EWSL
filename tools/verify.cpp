@@ -87,6 +87,24 @@ static void Prep(HWND hwnd) {
 }
 
 static void Shot(HWND hwnd, const char* path, bool verbose) {
+
+    // A capture is only meaningful once the window is actually on screen:
+    // a minimised or half-off-the-work-area window still writes a full-size
+    // PNG, it is just full of black. Check rather than trust the caller.
+    // Re-pose only when it really drifted -- SetWindowPos on an untouched
+    // window fires WM_KILLFOCUS, which closes a dropdown we are about to shoot.
+    bool drift = IsIconic(hwnd) != 0;
+    if (!drift) {
+        RECT wr, wa;
+        memset(&wr, 0, sizeof(wr));
+        memset(&wa, 0, sizeof(wa));
+        GetWindowRect(hwnd, &wr);
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        drift = (wr.right - wr.left < 200 || wr.bottom - wr.top < 200 ||
+                 wr.left < wa.left || wr.top < wa.top ||
+                 wr.right > wa.right || wr.bottom > wa.bottom);
+    }
+    if (drift) Prep(hwnd);
     if (!IsWindow(hwnd)) { printf("shot(%s): window gone\n", path); return; }
 
     RECT rc;
@@ -179,6 +197,16 @@ static void Click(HWND hwnd, int x, int y) {
     PostMessageW(hwnd, WM_LBUTTONUP, 0, lp);
 }
 
+// The theme the application has persisted to its own settings file. Used as
+// proof that a synthetic click on 浅色 / 深色 actually landed on the button.
+static int SavedTheme() {
+    wchar_t path[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return -1;
+    lstrcatW(path, L"\\WslEmbed\\settings.ini");
+    return (int)GetPrivateProfileIntW(L"ui", L"theme", -1, path);
+}
+
 // Centre of the 浅色 / 深色 segmented buttons on the settings page, recomputed
 // with the same arithmetic src/ui.cpp uses (settingsColumns + mkCtl layout).
 static void ThemeBtnCenters(HWND hwnd, int dpi, int& lightX, int& darkX, int& y) {
@@ -208,7 +236,11 @@ static void ThemeBtnCenters(HWND hwnd, int dpi, int& lightX, int& darkX, int& y)
     int setRight = setLeft + listW;
 
     int titleH   = (int)(46 * s + 0.5);
-    int setRowH  = (int)(46 * s + 0.5);
+    // Mirrors src/ui.cpp's settings layout, and has to be kept in step with it.
+    // It drifted once already: adding the language row took setRowH from 46 to
+    // 40, the "light" click landed 4 px below its button, and the run happily
+    // wrote two identical dark screenshots. CheckTheme() below catches that.
+    int setRowH  = (int)(40 * s + 0.5);
     int ctlH     = (int)(26 * s + 0.5);
     int listTop  = titleH + (int)(18 * s + 0.5) + (int)(34 * s + 0.5);
 
@@ -328,11 +360,15 @@ int main(int argc, char** argv) {
         Prep(hwnd);
         Click(hwnd, navX, navY[3]);
         Sleep(1500);
+        printf("theme before = %d\n", SavedTheme());
         sprintf(p, "%s-set-dark.png", prefix);
         Shot(hwnd, p, false);
 
         Click(hwnd, lx, ty);
         Sleep(1200);
+        if (SavedTheme() != 0)
+            printf("** WARN: clicking 浅色 did not switch the theme (theme=%d)"
+                   " -- the button centres have drifted from src/ui.cpp\n", SavedTheme());
         sprintf(p, "%s-set-light.png", prefix);
         Shot(hwnd, p, false);
 
@@ -345,6 +381,9 @@ int main(int argc, char** argv) {
         Sleep(1200);
         Click(hwnd, dx, ty);
         Sleep(1200);
+        if (SavedTheme() != 1)
+            printf("** WARN: clicking 深色 did not switch the theme (theme=%d)\n",
+                   SavedTheme());
         Click(hwnd, navX, navY[0]);
         Sleep(1200);
         sprintf(p, "%s-term-dark.png", prefix);
@@ -360,6 +399,7 @@ int main(int argc, char** argv) {
     if (shotsMode) {
         // ---- README 截图集：走一遍四个页面 + 发行版浮层 ----------------------
         // 标题栏里的发行版按钮：与 src/ui.cpp 的 layout() 用同一组算式。
+        Prep(hwnd);
         RECT cr;
         memset(&cr, 0, sizeof(cr));
         GetClientRect(hwnd, &cr);
@@ -387,8 +427,10 @@ int main(int argc, char** argv) {
 
         Prep(hwnd);
         Click(hwnd, dbx, dby);
-        // 在线清单走 `wsl --list --online`，超时上限 25s，等它落地再抓。
-        Sleep(27000);
+        // The flyout fills its "Available" half from `wsl --list --online`, which
+        // takes a while on a cold cache; wait it out so the screenshot shows the
+        // whole list instead of a spinner.
+        Sleep(21000);
         sprintf(p, "%s-distro-menu.png", prefix);
         Shot(hwnd, p, false);
         printf("wrote %s\n", p);

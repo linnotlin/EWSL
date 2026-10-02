@@ -23,6 +23,7 @@
 #include "download.h"
 #include "editor.h"
 #include "fs.h"
+#include "lang.h"
 #include "render.h"
 #include "terminal.h"
 #include "ui.h"
@@ -799,6 +800,7 @@ static void loadSettings(App* app) {
     int th = (int)GetPrivateProfileIntW(L"ui", L"theme", 0, p.c_str());
     int tm = (int)GetPrivateProfileIntW(L"ui", L"terminalMode", 0, p.c_str());
     int cok = (int)GetPrivateProfileIntW(L"ui", L"conptyOk", -1, p.c_str());
+    int lang = (int)GetPrivateProfileIntW(L"ui", L"language", LANG_AUTO, p.c_str());
 
     if (tf < 0) tf = f;
 
@@ -809,12 +811,18 @@ static void loadSettings(App* app) {
     if (th != 0 && th != 1) th = 0;
     if (tm < 0 || tm > 2) tm = 0;
     if (cok < -1 || cok > 1) cok = -1;
+    if (lang < LANG_AUTO || lang > LANG_EN) lang = LANG_AUTO;
 
     app->model.fontSize = f;
     app->model.termFontSize = tf;
     app->model.theme = th;
     app->model.terminalMode = tm;
     app->conptyOk = cok;
+    app->model.lang = lang;
+
+    // Language has to be settled before anything can build a label, so this is
+    // the one thing loadSettings does that is not just filling in the model.
+    langInit(lang);
 
     WCHAR broken[2048];
     broken[0] = 0;
@@ -849,6 +857,9 @@ static void saveSettings(App* app) {
 
     wsprintfW(buf, L"%d", app->conptyOk);
     WritePrivateProfileStringW(L"ui", L"conptyOk", buf, p.c_str());
+
+    wsprintfW(buf, L"%d", app->model.lang);
+    WritePrivateProfileStringW(L"ui", L"language", buf, p.c_str());
 
     std::wstring joined;
     for (size_t i = 0; i < app->brokenDistros.size(); ++i) {
@@ -938,19 +949,19 @@ static void buildModel(App* app) {
     m.brokenDistros = app->brokenDistros;
 
     if (app->page == PAGE_TERMINAL) {
-        m.title = m.activeDistro.empty() ? L"终端" : (L"终端 · " + m.activeDistro);
+        m.title = m.activeDistro.empty() ? LS(L"终端") : (LS(L"终端 · ") + m.activeDistro);
         m.hint = m.hasTerminal ? std::wstring() : L"WSL";
     } else if (app->page == PAGE_PROJECT) {
-        m.title = m.editorOpen ? (m.editorName + L" — 项目") : L"项目";
+        m.title = m.editorOpen ? (m.editorName + LS(L" — 项目")) : LS(L"项目");
         m.hint = app->folder;
     } else if (app->page == PAGE_DISTRO) {
-        m.title = L"发行版";
-        m.hint = m.wslPath.empty() ? std::wstring(L"未找到 wsl.exe") : std::wstring();
+        m.title = LS(L"发行版");
+        m.hint = m.wslPath.empty() ? std::wstring(LS(L"未找到 wsl.exe")) : std::wstring();
     } else if (app->page == PAGE_INSTALL) {
-        m.title = L"安装 " + (m.instName.empty() ? std::wstring(L"发行版") : m.instName);
-        m.hint = m.instStage == INST_IDLE ? std::wstring() : L"安装";
+        m.title = LS(L"安装 ") + (m.instName.empty() ? std::wstring(LS(L"发行版")) : m.instName);
+        m.hint = m.instStage == INST_IDLE ? std::wstring() : LS(L"安装");
     } else {
-        m.title = L"设置";
+        m.title = LS(L"设置");
         m.hint.clear();
     }
 
@@ -1380,7 +1391,7 @@ static DWORD WINAPI PrepUnregisterThread(LPVOID param) {
 
 static bool unregisterDistro(const std::wstring& id, std::wstring* out) {
     std::wstring exe = findWslExe();
-    if (exe.empty()) { if (out) *out = L"未找到 wsl.exe"; return false; }
+    if (exe.empty()) { if (out) *out = LS(L"未找到 wsl.exe"); return false; }
 
     runCapture(L"\"" + exe + L"\" --terminate " + distroArg(id), 20000);
 
@@ -1417,23 +1428,18 @@ static bool launchTerminal(App* app, const std::wstring& distro) {
             app->model.hasTerminal = false;
             app->model.activeDistro = distro;
 
-            termPrint(app, L"\r\n[EWSL] 发行版 " + distro + L" 没有可用的注册信息。\r\n\r\n");
+            termPrint(app, LS(L"\r\n[EWSL] 发行版 ") + distro + LS(L" 没有可用的注册信息。\r\n\r\n"));
             if (app->model.installed.empty()) {
-                termPrint(app, L"  WSL 里当前没有任何发行版。\r\n");
+                termPrint(app, LS(L"  WSL 里当前没有任何发行版。\r\n"));
             } else {
-                termPrint(app, L"  WSL 当前可用的发行版：\r\n");
+                termPrint(app, LS(L"  WSL 当前可用的发行版：\r\n"));
                 for (size_t i = 0; i < app->model.installed.size(); ++i) {
                     termPrint(app, L"    · " + app->model.installed[i] + L"\r\n");
                 }
             }
-            termPrint(app, L"\r\n  直接执行 wsl -d " + distro + L" 会返回 "
-                           L"Wsl/Service/WSL_E_DISTRO_NOT_FOUND，\r\n"
-                           L"  说明它只在注册表里留了名字，实际启动不了（常见于上次导入没跑完）。\r\n\r\n"
-                           L"  修复：点上方发行版菜单 → 选 " + distro + L" → 「重新安装」，\r\n"
-                           L"        安装页会先清掉同名旧注册项，再重新下载导入。\r\n"
-                           L"  手动清理：wsl --unregister " + distro + L"\r\n");
+            termPrint(app, LS(L"\r\n  直接执行 wsl -d ") + distro + LS(L" 会返回 Wsl/Service/WSL_E_DISTRO_NOT_FOUND，\r\n  说明它只在注册表里留了名字，实际启动不了（常见于上次导入没跑完）。\r\n\r\n  修复：点上方发行版菜单 → 选 ") + distro + LS(L" → 「重新安装」，\r\n        安装页会先清掉同名旧注册项，再重新下载导入。\r\n  手动清理：wsl --unregister ") + distro + L"\r\n");
 
-            showToast(app, L"发行版 " + distro + L" 的注册信息不可用，可从菜单重新安装");
+            showToast(app, LS(L"发行版 ") + distro + LS(L" 的注册信息不可用，可从菜单重新安装"));
             app->model.distroMenuOpen = true;
             syncOnlineInstalled(app);
             refreshUi(app);
@@ -1459,13 +1465,13 @@ static bool launchTerminal(App* app, const std::wstring& distro) {
         app->model.activeDistro = distro;
 
         std::wstring exe = cachedWslPath();
-        termPrint(app, L"\r\n无法启动 wsl.exe\r\n\r\n");
-        termPrint(app, L"  检测到的位置: " + (exe.empty() ? std::wstring(L"未找到") : exe) + L"\r\n");
-        termPrint(app, L"  目标发行版: " + (distro.empty() ? std::wstring(L"(默认)") : distro) + L"\r\n\r\n");
-        termPrint(app, L"排查建议\r\n");
-        termPrint(app, L"  1. 在 PowerShell 中执行 wsl --status 确认 WSL 已启用\r\n");
-        termPrint(app, L"  2. 执行 wsl -l -v 确认发行版名称与本程序识别的一致\r\n");
-        termPrint(app, L"  3. 若未安装发行版，展开左侧「终端」菜单选择安装\r\n");
+        termPrint(app, LS(L"\r\n无法启动 wsl.exe\r\n\r\n"));
+        termPrint(app, LS(L"  检测到的位置: ") + (exe.empty() ? std::wstring(LS(L"未找到")) : exe) + L"\r\n");
+        termPrint(app, LS(L"  目标发行版: ") + (distro.empty() ? std::wstring(LS(L"(默认)")) : distro) + L"\r\n\r\n");
+        termPrint(app, LS(L"排查建议\r\n"));
+        termPrint(app, LS(L"  1. 在 PowerShell 中执行 wsl --status 确认 WSL 已启用\r\n"));
+        termPrint(app, LS(L"  2. 执行 wsl -l -v 确认发行版名称与本程序识别的一致\r\n"));
+        termPrint(app, LS(L"  3. 若未安装发行版，展开左侧「终端」菜单选择安装\r\n"));
         return false;
     }
 
@@ -1477,7 +1483,7 @@ static bool launchTerminal(App* app, const std::wstring& distro) {
 
     std::wstring exe = findWslExe();
     if (exe.empty()) {
-        termPrint(app, L"[EWSL] 未找到 wsl.exe\r\n");
+        termPrint(app, LS(L"[EWSL] 未找到 wsl.exe\r\n"));
     }
     return true;
 }
@@ -1678,7 +1684,7 @@ static void startDownload(App* app) {
     abortInstall(app);
     clearPartialFile(app->instFile);
 
-    instSetStage(app, INST_DOWNLOAD, L"正在下载镜像…", L"");
+    instSetStage(app, INST_DOWNLOAD, LS(L"正在下载镜像…"), L"");
     app->model.instPercent = -1;
     app->model.instGot = 0;
     app->model.instTotal = 0;
@@ -1691,7 +1697,7 @@ static void beginStoreInstall(App* app, const std::wstring& id,
                               const std::wstring& label,
                               const std::wstring& reason) {
     app->model.instLog.clear();
-    jobLog(app, L"使用 WSL 官方安装通道：" + id);
+    jobLog(app, LS(L"使用 WSL 官方安装通道：") + id);
 
     if (!reason.empty()) jobLog(app, L"!" + reason);
 
@@ -1704,8 +1710,8 @@ static void beginStoreInstall(App* app, const std::wstring& id,
     app->model.instUrl.clear();
 
     if (!startJob(app, args)) {
-        app->model.instErr = L"无法启动 wsl.exe。请确认已启用 WSL（wsl --install --no-distribution）。";
-        instSetStage(app, INST_FAILED, L"安装失败", app->model.instErr);
+        app->model.instErr = LS(L"无法启动 wsl.exe。请确认已启用 WSL（wsl --install --no-distribution）。");
+        instSetStage(app, INST_FAILED, LS(L"安装失败"), app->model.instErr);
         app->model.instCancelable = false;
         return;
     }
@@ -1715,8 +1721,8 @@ static void beginStoreInstall(App* app, const std::wstring& id,
     app->pendingLabel = label;
     app->pendingStart = id;
     app->model.installing = true;
-    instSetStage(app, INST_DOWNLOAD, L"正在通过 WSL 下载 " + label + L"…",
-                 noLaunch ? L"下载完成后自动注册，不会自动进入" : L"当前 WSL 版本较旧，安装后可能自动进入");
+    instSetStage(app, INST_DOWNLOAD, LS(L"正在通过 WSL 下载 ") + label + L"…",
+                 noLaunch ? LS(L"下载完成后自动注册，不会自动进入") : LS(L"当前 WSL 版本较旧，安装后可能自动进入"));
 }
 
 static void runImport(App* app, int version) {
@@ -1730,15 +1736,15 @@ static void runImport(App* app, int version) {
     jobLog(app, L"> wsl " + args);
 
     if (!startJob(app, args)) {
-        app->model.instErr = L"无法启动 wsl.exe 执行导入。";
-        instSetStage(app, INST_FAILED, L"导入失败", app->model.instErr);
+        app->model.instErr = LS(L"无法启动 wsl.exe 执行导入。");
+        instSetStage(app, INST_FAILED, LS(L"导入失败"), app->model.instErr);
         return;
     }
 
     app->jobMode = true;
     app->instAttempt = version;
-    instSetStage(app, INST_IMPORT, L"正在导入到 WSL…（首次导入需要几十秒）",
-                 L"镜像 " + app->instFile);
+    instSetStage(app, INST_IMPORT, LS(L"正在导入到 WSL…（首次导入需要几十秒）"),
+                 LS(L"镜像 ") + app->instFile);
 }
 
 static void beginInstall(App* app, const std::wstring& id) {
@@ -1757,8 +1763,8 @@ static void beginInstall(App* app, const std::wstring& id) {
     app->ui->resetBarAnim();
 
     if (id.empty()) {
-        app->model.instErr = L"未选择发行版";
-        instSetStage(app, INST_FAILED, L"未选择发行版", L"");
+        app->model.instErr = LS(L"未选择发行版");
+        instSetStage(app, INST_FAILED, LS(L"未选择发行版"), L"");
         gotoPage(app, PAGE_INSTALL);
         refreshUi(app);
         return;
@@ -1779,7 +1785,7 @@ static void beginInstall(App* app, const std::wstring& id) {
     app->model.instTotal = 0;
     app->model.instUrl.clear();
     app->model.instHint.clear();
-    instSetStage(app, INST_RESOLVE, L"正在解析镜像地址…", L"");
+    instSetStage(app, INST_RESOLVE, LS(L"正在解析镜像地址…"), L"");
     refreshUi(app);
 
     const DistroImage* img = findImage(id);
@@ -1799,16 +1805,16 @@ static void beginInstall(App* app, const std::wstring& id) {
 
     if (url.empty()) {
         beginStoreInstall(app, id, app->instLabel,
-                          img ? L"内置目录里没有适配本机架构的直链镜像，改用 wsl --install"
-                              : L"该发行版没有独立镜像包，改用 wsl --install");
+                          img ? LS(L"内置目录里没有适配本机架构的直链镜像，改用 wsl --install")
+                              : LS(L"该发行版没有独立镜像包，改用 wsl --install"));
         refreshUi(app);
         return;
     }
 
     std::wstring dir = defaultInstallDir(id);
     if (dir.empty()) {
-        app->model.instErr = L"无法创建安装目录（%LOCALAPPDATA% 不可写）";
-        instSetStage(app, INST_FAILED, L"准备失败", app->model.instErr);
+        app->model.instErr = LS(L"无法创建安装目录（%LOCALAPPDATA% 不可写）");
+        instSetStage(app, INST_FAILED, LS(L"准备失败"), app->model.instErr);
         refreshUi(app);
         return;
     }
@@ -1820,9 +1826,9 @@ static void beginInstall(App* app, const std::wstring& id) {
     app->instUrl = url;
     app->model.instUrl = url;
 
-    jobLog(app, L"发行版：" + app->instLabel + L"（" + id + L"）");
-    jobLog(app, L"下载到：" + app->instFile);
-    jobLog(app, L"安装到：" + dir);
+    jobLog(app, LS(L"发行版：") + app->instLabel + LS(L"（") + id + LS(L"）"));
+    jobLog(app, LS(L"下载到：") + app->instFile);
+    jobLog(app, LS(L"安装到：") + dir);
     jobLog(app, L"");
     jobLog(app, L"> GET " + url);
 
@@ -1837,7 +1843,7 @@ static void beginInstall(App* app, const std::wstring& id) {
 
         if (mayExist) {
             jobLog(app, L"");
-            jobLog(app, L"!检测到同名旧注册项 " + name + L"，正在后台清理…");
+            jobLog(app, LS(L"!检测到同名旧注册项 ") + name + LS(L"，正在后台清理…"));
 
             PrepUnregArg* a = new PrepUnregArg();
             a->app  = app;
@@ -1849,7 +1855,7 @@ static void beginInstall(App* app, const std::wstring& id) {
                 CloseHandle(h);
             } else {
                 delete a;
-                jobLog(app, L"!注销线程启动失败，仍继续导入（可能因重名而失败）");
+                jobLog(app, LS(L"!注销线程启动失败，仍继续导入（可能因重名而失败）"));
             }
 
             return;
@@ -2003,7 +2009,7 @@ static void syncTermSize(App* app, int clientW, int clientH, bool notify) {
 
 static void openFileInEditor(App* app, const std::wstring& path) {
     if (!app->ed->open(path)) {
-        MessageBoxW(app->hwnd, L"无法打开该文件。", L"EWSL", MB_OK | MB_ICONWARNING);
+        MessageBoxW(app->hwnd, LS(L"无法打开该文件。"), L"EWSL", MB_OK | MB_ICONWARNING);
         return;
     }
     app->ed->setCursor(0, 0, false);
@@ -2348,13 +2354,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                 if (startSession(app, a2, TRANSPORT_PIPE)) {
                     SetTimer(hwnd, TIMER_PTYWAIT, 3000, NULL);
-                    termPrint(app, L"[EWSL] ConPTY 通道没有输出，"
-                                   L"已自动改用兼容通道并启动交互式 shell。\r\n\r\n");
+                    termPrint(app, LS(L"[EWSL] ConPTY 通道没有输出，已自动改用兼容通道并启动交互式 shell。\r\n\r\n"));
                     refreshUi(app);
                     InvalidateRect(hwnd, NULL, FALSE);
                     return 0;
                 }
-                termPrint(app, L"[EWSL] 兼容通道也没能启动。\r\n");
+                termPrint(app, LS(L"[EWSL] 兼容通道也没能启动。\r\n"));
             }
 
             KillTimer(hwnd, TIMER_PTYWAIT);
@@ -2388,8 +2393,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 bool wasAuto = app->autoTarget;
                 app->autoTarget = false;
 
-                termPrint(app, L"\r\n[EWSL] wsl 报告找不到发行版 " + id + L"。\r\n"
-                               L"  正在后台确认它到底还能不能用…\r\n");
+                termPrint(app, LS(L"\r\n[EWSL] wsl 报告找不到发行版 ") + id + LS(L"。\r\n  正在后台确认它到底还能不能用…\r\n"));
 
                 if (!app->verifying) {
                     app->verifying = true;
@@ -2441,7 +2445,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 syncOnlineInstalled(app);
             }
 
-            showToast(app, id + L" 实际可用，已重新启动");
+            showToast(app, id + LS(L" 实际可用，已重新启动"));
 
             app->quietExit = true;
             if (app->hpc || app->term) stopPty(app);
@@ -2459,24 +2463,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
 
             if (wasAuto && !next.empty()) {
-                showToast(app, id + L" 不可用，已切换到 " + next);
+                showToast(app, id + LS(L" 不可用，已切换到 ") + next);
 
                 app->quietExit = true;
                 if (app->hpc || app->term) stopPty(app);
                 app->autoTarget = false;
                 launchTerminal(app, next);
             } else {
-                termPrint(app, L"\r\n[EWSL] 确认 " + id + L" 已经启动不了。\r\n"
-                               L"  已标记为「注册信息失效」：菜单里它回到「可安装」区，\r\n"
-                               L"  右侧标签是红色的「重新安装」——点它会先执行\r\n"
-                               L"    wsl --unregister " + id + L"\r\n"
-                               L"  再重新下载导入。也可以手动执行这条命令。\r\n");
+                termPrint(app, LS(L"\r\n[EWSL] 确认 ") + id + LS(L" 已经启动不了。\r\n  已标记为「注册信息失效」：菜单里它回到「可安装」区，\r\n  右侧标签是红色的「重新安装」——点它会先执行\r\n    wsl --unregister ") + id + LS(L"\r\n  再重新下载导入。也可以手动执行这条命令。\r\n"));
 
                 if (wasAuto) {
-                    termPrint(app, L"  当前没有其他可用的发行版，请从上方菜单下载安装。\r\n\r\n");
+                    termPrint(app, LS(L"  当前没有其他可用的发行版，请从上方菜单下载安装。\r\n\r\n"));
                     app->model.hasTerminal = false;
                 }
-                showToast(app, id + L" 的注册信息不可用，点菜单里的「重新安装」");
+                showToast(app, id + LS(L" 的注册信息不可用，点菜单里的「重新安装」"));
             }
         }
 
@@ -2492,10 +2492,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         p.total = app->model.instTotal;
         p.percent = app->model.instPercent;
 
-        std::wstring text = L"正在下载镜像 " + formatBytes(p.got);
+        std::wstring text = LS(L"正在下载镜像 ") + formatBytes(p.got);
         if (p.total > 0) {
             text += L" / " + formatBytes(p.total);
-            text += L"（" + std::to_wstring(p.percent < 0 ? 0 : p.percent) + L"%）";
+            text += LS(L"（") + std::to_wstring(p.percent < 0 ? 0 : p.percent) + LS(L"%）");
         }
         app->model.instStageText = text;
         app->model.instDetail = app->model.instUrl;
@@ -2516,17 +2516,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         if (ok) {
-            jobLog(app, L"+镜像下载完成：" + formatBytes(app->model.instGot));
+            jobLog(app, LS(L"+镜像下载完成：") + formatBytes(app->model.instGot));
             jobLog(app, L"");
             runImport(app, 2);
         } else {
             bool canceled = (InterlockedCompareExchange(&app->instCancel, 0, 0) != 0);
-            app->model.instErr = emsg.empty() ? L"下载失败" : emsg;
-            jobLog(app, L"!下载失败：" + app->model.instErr);
+            app->model.instErr = emsg.empty() ? LS(L"下载失败") : emsg;
+            jobLog(app, LS(L"!下载失败：") + app->model.instErr);
             instSetStage(app, canceled ? INST_CANCELED : INST_FAILED,
-                         canceled ? L"已取消" : L"下载失败", app->model.instErr);
+                         canceled ? LS(L"已取消") : LS(L"下载失败"), app->model.instErr);
             if (canceled) app->model.instPercent = -1;
-            app->model.instHint = L"可以点「重试」重新下载，或改用 WSL 官方通道安装。";
+            app->model.instHint = LS(L"可以点「重试」重新下载，或改用 WSL 官方通道安装。");
         }
         refreshUi(app);
         return 0;
@@ -2552,10 +2552,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 app->pendingInstall.clear();
                 app->pendingStart.clear();
                 app->model.installing = false;
-                jobLog(app, L"已取消");
-                app->model.instErr = L"安装已取消";
-                app->model.instHint = L"可以点「重试」重新开始。";
-                instSetStage(app, INST_CANCELED, L"已取消", L"");
+                jobLog(app, LS(L"已取消"));
+                app->model.instErr = LS(L"安装已取消");
+                app->model.instHint = LS(L"可以点「重试」重新开始。");
+                instSetStage(app, INST_CANCELED, LS(L"已取消"), L"");
                 app->model.instPercent = -1;
                 refreshUi(app);
                 return 0;
@@ -2563,21 +2563,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             bool stepOk = (!haveCode || code == 0);
             wchar_t buf[220];
-            if (haveCode) wsprintfW(buf, L"（退出码 %lu）", (unsigned long)code);
+            if (haveCode) wsprintfW(buf, LS(L"（退出码 %lu）"), (unsigned long)code);
             else          buf[0] = 0;
 
             if (app->instIsFix) {
                 app->instIsFix = false;
                 if (stepOk) {
-                    jobLog(app, L"+WSL 内核已更新");
-                    instSetStage(app, INST_DONE, L"WSL 已更新",
-                                 L"点右下角返回，然后重新检测环境");
+                    jobLog(app, LS(L"+WSL 内核已更新"));
+                    instSetStage(app, INST_DONE, LS(L"WSL 已更新"),
+                                 LS(L"点右下角返回，然后重新检测环境"));
                     app->model.instPercent = 100;
                 } else {
-                    jobLog(app, L"!wsl --update 失败" + std::wstring(buf));
-                    app->model.instErr = L"wsl --update 失败";
-                    app->model.instHint = L"可以试试用管理员身份运行，或先执行 wsl --shutdown。";
-                    instSetStage(app, INST_FAILED, L"更新失败", app->model.instErr);
+                    jobLog(app, LS(L"!wsl --update 失败") + std::wstring(buf));
+                    app->model.instErr = LS(L"wsl --update 失败");
+                    app->model.instHint = LS(L"可以试试用管理员身份运行，或先执行 wsl --shutdown。");
+                    instSetStage(app, INST_FAILED, LS(L"更新失败"), app->model.instErr);
                 }
                 refreshUi(app);
                 return 0;
@@ -2585,27 +2585,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             if (app->instStage == INST_IMPORT) {
                 if (stepOk) {
-                    jobLog(app, L"+导入完成，正在校验…");
+                    jobLog(app, LS(L"+导入完成，正在校验…"));
                     app->pendingStart = app->instDistro;
                     app->model.installing = false;
-                    instSetStage(app, INST_VERIFY, L"正在校验安装结果…", L"");
+                    instSetStage(app, INST_VERIFY, LS(L"正在校验安装结果…"), L"");
                     CreateThread(NULL, 0, ProbeThread, app, 0, NULL);
                     refreshUi(app);
                     return 0;
                 }
 
                 if (app->instAttempt != 1) {
-                    jobLog(app, L"!WSL2 导入失败，改用 WSL1 重试…");
+                    jobLog(app, LS(L"!WSL2 导入失败，改用 WSL1 重试…"));
                     runImport(app, 1);
                     refreshUi(app);
                     return 0;
                 }
 
-                jobLog(app, L"!导入失败" + std::wstring(buf));
-                app->model.instErr = L"wsl --import 失败，请检查是否已启用 WSL2（wsl --status）";
-                app->model.instHint = L"点「重试」重新导入，或用 WSL 官方通道安装。";
+                jobLog(app, LS(L"!导入失败") + std::wstring(buf));
+                app->model.instErr = LS(L"wsl --import 失败，请检查是否已启用 WSL2（wsl --status）");
+                app->model.instHint = LS(L"点「重试」重新导入，或用 WSL 官方通道安装。");
                 app->pendingStart.clear();
-                instSetStage(app, INST_FAILED, L"导入失败", app->model.instErr);
+                instSetStage(app, INST_FAILED, LS(L"导入失败"), app->model.instErr);
                 refreshUi(app);
                 return 0;
             }
@@ -2618,16 +2618,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 app->model.installing = false;
 
                 if (!stepOk) {
-                    jobLog(app, L"!wsl --install 失败" + std::wstring(buf));
-                    app->model.instErr = L"wsl --install 未成功";
-                    app->model.instHint = L"常见原因：网络不可达、未启用「虚拟机平台」、发行版 id 不被当前 WSL 版本支持。";
+                    jobLog(app, LS(L"!wsl --install 失败") + std::wstring(buf));
+                    app->model.instErr = LS(L"wsl --install 未成功");
+                    app->model.instHint = LS(L"常见原因：网络不可达、未启用「虚拟机平台」、发行版 id 不被当前 WSL 版本支持。");
                     app->pendingStart.clear();
-                    instSetStage(app, INST_FAILED, L"安装失败", app->model.instErr);
+                    instSetStage(app, INST_FAILED, LS(L"安装失败"), app->model.instErr);
                 } else {
-                    jobLog(app, L"+wsl --install 已完成，正在校验…");
+                    jobLog(app, LS(L"+wsl --install 已完成，正在校验…"));
                     app->pendingStart = d;
                     instSetStage(app, INST_VERIFY,
-                                 L"正在刷新发行版列表…", label);
+                                 LS(L"正在刷新发行版列表…"), label);
                     CreateThread(NULL, 0, ProbeThread, app, 0, NULL);
                 }
             }
@@ -2650,17 +2650,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (app->term) {
             wchar_t buf[220];
             if (haveCode && code != 0) {
-                wsprintfW(buf, L"\r\n[进程已退出，退出码 0x%08X]\r\n", (unsigned)code);
+                wsprintfW(buf, LS(L"\r\n[进程已退出，退出码 0x%08X]\r\n"), (unsigned)code);
                 termPrint(app, buf);
             } else if (haveCode) {
-                termPrint(app, L"\r\n[进程正常退出]\r\n");
+                termPrint(app, LS(L"\r\n[进程正常退出]\r\n"));
             } else {
-                termPrint(app, L"\r\n[进程已退出]\r\n");
+                termPrint(app, LS(L"\r\n[进程已退出]\r\n"));
             }
 
             if (app->ptyBytes == 0) {
-                termPrint(app, L"本次未收到任何输出。请在 PowerShell 执行 wsl -l -v "
-                               L"确认是否已安装发行版。\r\n");
+                termPrint(app, LS(L"本次未收到任何输出。请在 PowerShell 执行 wsl -l -v 确认是否已安装发行版。\r\n"));
             }
         }
 
@@ -2675,10 +2674,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (app) {
                 app->unregisterBusy = false;
                 if (a->ok) {
-                    showToast(app, L"已注销 " + a->id);
+                    showToast(app, LS(L"已注销 ") + a->id);
                     refreshDistros(app);
                 } else {
-                    showToast(app, L"注销失败，该发行版可能正在使用中");
+                    showToast(app, LS(L"注销失败，该发行版可能正在使用中"));
                     refreshUi(app);
                 }
             }
@@ -2694,7 +2693,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (app && app->prepUnregistering) {
             app->prepUnregistering = false;
             if (a->ok) {
-                jobLog(app, L"+已注销旧注册项 " + a->name);
+                jobLog(app, LS(L"+已注销旧注册项 ") + a->name);
                 clearBrokenDistro(app, a->name);
                 for (size_t i = 0; i < app->model.installed.size(); ) {
                     if (lstrcmpiW(app->model.installed[i].c_str(), a->name.c_str()) == 0)
@@ -2704,7 +2703,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 syncOnlineInstalled(app);
                 saveSettings(app);
             } else {
-                jobLog(app, L"!旧注册项注销失败，仍继续导入（可能因重名而失败）");
+                jobLog(app, LS(L"!旧注册项注销失败，仍继续导入（可能因重名而失败）"));
                 if (!a->out.empty()) jobLog(app, L"  " + a->out);
             }
             startDownload(app);
@@ -2728,7 +2727,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             bool changed = false;
             std::wstring names;
             for (size_t i = 0; i < r->dead.size(); ++i) {
-                if (!names.empty()) names += L"、";
+                if (!names.empty()) names += LS(L"、");
                 names += r->dead[i];
                 if (!isDistroBroken(app, r->dead[i])) {
                     app->brokenDistros.push_back(r->dead[i]);
@@ -2738,7 +2737,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (changed) saveSettings(app);
 
             if (!app->suppressLaunch) {
-                showToast(app, names + L" 的根文件系统已丢失，可在菜单里「重新安装」");
+                showToast(app, names + LS(L" 的根文件系统已丢失，可在菜单里「重新安装」"));
             }
         }
 
@@ -2788,8 +2787,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
 
             app->pendingStart.clear();
-            jobLog(app, found ? L"+注册成功：" + app->instDistro
-                              : L"!注册后未在 wsl -l -q 中看到 " + app->instDistro);
+            jobLog(app, found ? LS(L"+注册成功：") + app->instDistro
+                              : LS(L"!注册后未在 wsl -l -q 中看到 ") + app->instDistro);
 
             if (found) {
                 app->pendingStart = app->instDistro;
@@ -2797,15 +2796,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     clearBrokenDistro(app, app->instDistro);
                     saveSettings(app);
                 }
-                instSetStage(app, INST_DONE, L"安装完成",
-                             app->instLabel + L" 已就绪，点右下角进入终端");
+                instSetStage(app, INST_DONE, LS(L"安装完成"),
+                             app->instLabel + LS(L" 已就绪，点右下角进入终端"));
                 app->model.instErr.clear();
                 app->model.instHint.clear();
                 app->model.instPercent = 100;
             } else {
-                app->model.instErr = L"安装已完成但 WSL 未注册该发行版";
-                app->model.instHint = L"可能是 WSL 需要重启：在 PowerShell 执行 wsl --shutdown 后重试。";
-                instSetStage(app, INST_FAILED, L"注册校验失败", app->model.instErr);
+                app->model.instErr = LS(L"安装已完成但 WSL 未注册该发行版");
+                app->model.instHint = LS(L"可能是 WSL 需要重启：在 PowerShell 执行 wsl --shutdown 后重试。");
+                instSetStage(app, INST_FAILED, LS(L"注册校验失败"), app->model.instErr);
             }
 
             delete r;
@@ -2828,8 +2827,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (lstrcmpiW(r->installed[i].c_str(), target.c_str()) == 0) { found = true; break; }
             }
             if (!found) {
-                termPrint(app, L"\r\n[EWSL] 安装流程结束了，但发行版列表里没有 " + target
-                               + L"。\r\n  请展开上方下拉菜单确认，或重新安装。\r\n");
+                termPrint(app, LS(L"\r\n[EWSL] 安装流程结束了，但发行版列表里没有 ") + target
+                               + LS(L"。\r\n  请展开上方下拉菜单确认，或重新安装。\r\n"));
                 target.clear();
                 app->suppressLaunch = true;
             }
@@ -2965,7 +2964,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     if (e->save()) {
                         refreshUi(app);
                     } else {
-                        MessageBoxW(hwnd, L"保存失败。", L"EWSL", MB_OK | MB_ICONWARNING);
+                        MessageBoxW(hwnd, LS(L"保存失败。"), L"EWSL", MB_OK | MB_ICONWARNING);
                     }
                 }
                 app->swallowChar = true;
@@ -3185,21 +3184,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case UI_NAV_TERMINAL:
             if (installRunning(app) && app->page != PAGE_INSTALL) {
                 gotoPage(app, PAGE_INSTALL);
-                showToast(app, L"安装正在进行，暂时不能离开安装页");
+                showToast(app, LS(L"安装正在进行，暂时不能离开安装页"));
                 return 0;
             }
             gotoPage(app, PAGE_TERMINAL);
             return 0;
         case UI_NAV_PROJECT:
             if (installRunning(app)) {
-                showToast(app, L"安装进行中，完成或取消后才能切换");
+                showToast(app, LS(L"安装进行中，完成或取消后才能切换"));
                 return 0;
             }
             gotoPage(app, PAGE_PROJECT);
             return 0;
         case UI_NAV_DISTRO:
             if (installRunning(app)) {
-                showToast(app, L"安装进行中，完成或取消后才能切换");
+                showToast(app, LS(L"安装进行中，完成或取消后才能切换"));
                 return 0;
             }
             gotoPage(app, PAGE_DISTRO);
@@ -3209,7 +3208,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         case UI_NAV_SETTINGS:
             if (installRunning(app)) {
-                showToast(app, L"安装进行中，完成或取消后才能切换");
+                showToast(app, LS(L"安装进行中，完成或取消后才能切换"));
                 return 0;
             }
             gotoPage(app, PAGE_SETTINGS);
@@ -3217,7 +3216,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case UI_DISTRO_MENU:
             if (installRunning(app)) {
-                showToast(app, L"安装进行中，请先等待或取消");
+                showToast(app, LS(L"安装进行中，请先等待或取消"));
                 return 0;
             }
             app->model.distroMenuOpen = !app->model.distroMenuOpen;
@@ -3242,7 +3241,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             app->model.distroMenuOpen = false;
             if (installRunning(app)) {
                 if (app->page != PAGE_INSTALL) gotoPage(app, PAGE_INSTALL);
-                showToast(app, L"已经有一个安装在进行中");
+                showToast(app, LS(L"已经有一个安装在进行中"));
                 return 0;
             }
             stopPty(app);
@@ -3252,13 +3251,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case UI_INSTALL_CANCEL:
             if (app->jobMode) {
                 app->instUserCancel = true;
-                jobLog(app, L"!用户取消");
-                app->model.instStageText = L"正在取消…";
+                jobLog(app, LS(L"!用户取消"));
+                app->model.instStageText = LS(L"正在取消…");
                 stopPty(app);
             } else {
                 InterlockedExchange(&app->instCancel, 1);
-                app->model.instStageText = L"正在取消…";
-                jobLog(app, L"!用户取消");
+                app->model.instStageText = LS(L"正在取消…");
+                jobLog(app, LS(L"!用户取消"));
             }
             refreshUi(app);
             return 0;
@@ -3270,7 +3269,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case UI_INSTALL_CLOSE:
             if (installRunning(app)) {
-                showToast(app, L"安装进行中，请先点「取消」");
+                showToast(app, LS(L"安装进行中，请先点「取消」"));
                 return 0;
             }
             if (app->instStage == INST_DONE && !app->pendingStart.empty()) {
@@ -3302,7 +3301,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case UI_DISTRO_OPEN:
             if (hit.arg.empty()) return 0;
             if (installRunning(app)) {
-                showToast(app, L"安装进行中，请先等待或取消");
+                showToast(app, LS(L"安装进行中，请先等待或取消"));
                 return 0;
             }
             if (app->model.activeDistro != hit.arg) {
@@ -3316,12 +3315,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case UI_DISTRO_DEFAULT:
             if (hit.arg.empty()) return 0;
-            showToast(app, L"正在设为默认…");
+            showToast(app, LS(L"正在设为默认…"));
             if (wslSetDefault(hit.arg)) {
-                showToast(app, L"已将 " + hit.arg + L" 设为默认发行版");
+                showToast(app, LS(L"已将 ") + hit.arg + LS(L" 设为默认发行版"));
                 refreshDistros(app);
             } else {
-                showToast(app, L"设置默认失败，可能已在此应用启动中");
+                showToast(app, LS(L"设置默认失败，可能已在此应用启动中"));
                 refreshUi(app);
             }
             return 0;
@@ -3329,7 +3328,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case UI_DISTRO_UNREGISTER:
             if (hit.arg.empty() || app->unregisterBusy) return 0;
             app->unregisterBusy = true;
-            showToast(app, L"正在注销 " + hit.arg + L"…");
+            showToast(app, LS(L"正在注销 ") + hit.arg + L"…");
             markDistroBadSession(app, hit.arg);
             refreshUi(app);
             startUnregisterThread(app, hit.arg);
@@ -3339,7 +3338,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (hit.arg.empty()) return 0;
             if (installRunning(app)) {
                 if (app->page != PAGE_INSTALL) gotoPage(app, PAGE_INSTALL);
-                showToast(app, L"已经有一个安装在进行中");
+                showToast(app, LS(L"已经有一个安装在进行中"));
                 return 0;
             }
             stopPty(app);
@@ -3460,6 +3459,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
+        case UI_SET_LANG_AUTO:
+        case UI_SET_LANG_ZH:
+        case UI_SET_LANG_EN: {
+            int mode = (hit.action == UI_SET_LANG_AUTO) ? LANG_AUTO
+                     : (hit.action == UI_SET_LANG_ZH ? LANG_ZH : LANG_EN);
+            if (mode == app->model.lang) return 0;
+            app->model.lang = mode;
+            langInit(mode);
+            saveSettings(app);
+            refreshUi(app);
+            return 0;
+        }
+
         case UI_RECHECK:
             app->model.checking = true;
             app->model.wslVersion.clear();
@@ -3474,11 +3486,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case UI_FIX_WSL: {
             if (installRunning(app)) {
-                showToast(app, L"安装进行中，请先等待或取消");
+                showToast(app, LS(L"安装进行中，请先等待或取消"));
                 return 0;
             }
             app->model.instLog.clear();
-            app->model.instName = L"修复 WSL";
+            app->model.instName = LS(L"修复 WSL");
             app->instDistro.clear();
             app->instDir.clear();
             {
@@ -3491,10 +3503,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             jobLog(app, L"> wsl --update");
             if (startJob(app, L"--update")) {
                 app->jobMode = true;
-                instSetStage(app, INST_IMPORT, L"正在更新 WSL 内核…", L"wsl --update");
+                instSetStage(app, INST_IMPORT, LS(L"正在更新 WSL 内核…"), L"wsl --update");
             } else {
-                app->model.instErr = L"无法启动 wsl.exe";
-                instSetStage(app, INST_FAILED, L"修复失败", app->model.instErr);
+                app->model.instErr = LS(L"无法启动 wsl.exe");
+                instSetStage(app, INST_FAILED, LS(L"修复失败"), app->model.instErr);
             }
             refreshUi(app);
             return 0;
@@ -3722,18 +3734,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (args == L"-h" || args == L"--help" || args == L"/?") {
         std::wstring help = L"EWSL (EasyWSL) ";
         help += kAppVersion;
-        help += L" - 内嵌 WSL 终端 / 代码编辑器\r\n"
-                L"MIT License\r\n\r\n"
-                L"  EWSL.exe              启动默认发行版\r\n"
-                L"  EWSL.exe -d <name>    指定发行版\r\n\r\n"
-                L"左侧边栏\r\n"
-                L"  终端    切换或安装 Linux 发行版\r\n"
-                L"  项目    打开文件夹、浏览目录、编辑代码\r\n"
-                L"  设置    字体大小、界面主题、终端模式\r\n\r\n"
-                L"快捷键\r\n"
-                L"  Ctrl + S            保存文件\r\n"
-                L"  Ctrl + 滚轮         缩放字体\r\n"
-                L"  Ctrl + Shift + C/V  终端复制 / 粘贴\r\n";
+        help += LS(L" - 内嵌 WSL 终端 / 代码编辑器\r\nMIT License\r\n\r\n  EWSL.exe              启动默认发行版\r\n  EWSL.exe -d <name>    指定发行版\r\n\r\n左侧边栏\r\n  终端    切换或安装 Linux 发行版\r\n  项目    打开文件夹、浏览目录、编辑代码\r\n  设置    字体大小、界面主题、终端模式\r\n\r\n快捷键\r\n  Ctrl + S            保存文件\r\n  Ctrl + 滚轮         缩放字体\r\n  Ctrl + Shift + C/V  终端复制 / 粘贴\r\n");
         MessageBoxW(NULL, help.c_str(), L"EWSL", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
@@ -3765,7 +3766,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     app.ui = new Ui();
     if (!app.ui->init(dpi)) {
-        MessageBoxW(NULL, L"初始化界面失败。", L"EWSL", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, LS(L"初始化界面失败。"), L"EWSL", MB_OK | MB_ICONERROR);
         delete app.ui;
         DeleteCriticalSection(&app.cs);
         return 1;
@@ -3773,7 +3774,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     app.rend = new Renderer();
     if (!app.rend->create(kInitialFontHeight)) {
-        MessageBoxW(NULL, L"初始化字体失败。", L"EWSL", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, LS(L"初始化字体失败。"), L"EWSL", MB_OK | MB_ICONERROR);
         delete app.rend;
         delete app.ui;
         DeleteCriticalSection(&app.cs);
@@ -3841,7 +3842,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hIconSm = hAppIconSm;
 
     if (!RegisterClassExW(&wc)) {
-        MessageBoxW(NULL, L"注册窗口类失败。", L"EWSL", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, LS(L"注册窗口类失败。"), L"EWSL", MB_OK | MB_ICONERROR);
         delete app.term;
         delete app.rend;
         delete app.ed;
@@ -3889,7 +3890,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 NULL, NULL, hInstance, NULL);
 
     if (!hwnd) {
-        MessageBoxW(NULL, L"创建窗口失败。", L"EWSL", MB_OK | MB_ICONERROR);
+        MessageBoxW(NULL, LS(L"创建窗口失败。"), L"EWSL", MB_OK | MB_ICONERROR);
         delete app.term;
         delete app.rend;
         delete app.ed;

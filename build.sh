@@ -25,6 +25,9 @@ SRCS=(
     src/render.cpp
     src/wsl.cpp
     src/fs.cpp
+    src/lang.cpp
+    src/catalog.cpp
+    src/download.cpp
     src/editor.cpp
     src/ui.cpp
 )
@@ -62,6 +65,8 @@ LDLIBS=(
     -ldwmapi
     -lole32
     -lshell32
+    -lwinhttp
+    -ladvapi32
 )
 
 if ! command -v "$CXX" >/dev/null 2>&1; then

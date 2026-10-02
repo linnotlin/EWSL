@@ -22,6 +22,7 @@ SRCS=(
     src/render.cpp
     src/wsl.cpp
     src/fs.cpp
+    src/lang.cpp
     src/catalog.cpp
     src/download.cpp
     src/editor.cpp

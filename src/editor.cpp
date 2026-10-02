@@ -2,6 +2,8 @@
 
 #include "fs.h"
 
+#include "lang.h"
+
 #include <algorithm>
 #include <set>
 
@@ -335,7 +337,7 @@ const std::wstring& Editor::line(int i) const {
 }
 
 std::wstring Editor::fileName() const {
-    if (m_path.empty()) return L"未命名";
+    if (m_path.empty()) return LS(L"未命名");
     return pathFileName(m_path);
 }
 

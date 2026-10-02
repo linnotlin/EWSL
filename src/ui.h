@@ -54,6 +54,9 @@ enum UiAction {
     UI_SET_THEME_LIGHT,
     UI_SET_THEME_DARK,
     UI_SET_TERM_AUTO,
+    UI_SET_LANG_AUTO,
+    UI_SET_LANG_ZH,
+    UI_SET_LANG_EN,
     UI_SET_TERM_PTY,
     UI_SET_TERM_PIPE,
     UI_FIX_WSL,
@@ -141,6 +144,7 @@ struct UiModel {
 
     int          terminalMode;
     int          activeMode;
+    int          lang;
 
     int          instStage;
     int          instPercent;
@@ -269,6 +273,7 @@ private:
         Box setFontDec, setFontInc, setTermFontDec, setTermFontInc;
         Box setLight, setDark;
         Box setTermAuto, setTermPty, setTermPipe;
+        Box setLangAuto, setLangZh, setLangEn;
         Box setFix, setRecheck;
         Box instBar, instCancel, instRetry, instClose, instLog;
         Box dList, dHdrInst, dHdrOnline, dRefresh, dHint;
@@ -288,7 +293,8 @@ private:
               edArea(), ed(), setList(), setSide(), setFontDec(), setFontInc(),
               setTermFontDec(), setTermFontInc(),
                               setLight(), setDark(), setTermAuto(), setTermPty(),
-                              setTermPipe(), setFix(), setRecheck(), instBar(), instCancel(),
+                              setTermPipe(), setLangAuto(), setLangZh(), setLangEn(),
+                              setFix(), setRecheck(), instBar(), instCancel(),
                               instRetry(), instClose(), instLog(),
                               dList(), dHdrInst(), dHdrOnline(), dRefresh(), dHint(),
               dOnlineFirst(0), dOnlineShown(0), dInstFirst(0),
