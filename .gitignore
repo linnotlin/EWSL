@@ -1,0 +1,20 @@
+# build output
+dist/
+*.exe
+*.pdb
+*.ilk
+*.obj
+
+# dev tool binary (tools/verify.cpp is the source, verify.exe is built locally)
+tools/verify.exe
+
+# local captures produced by tools/verify.exe
+tools/*.png
+
+# editor / OS noise
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
