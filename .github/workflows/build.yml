@@ -22,7 +22,7 @@ jobs:
         with:
           version: 0.14.1
 
-      # tools/make-rsrc.py 用 Pillow 把 icon.jpg 重编码成 8 档 RT_ICON。
+      # tools/make-rsrc.py 用 Pillow 把 icon.jpg 重编码成 12 档 RT_ICON。
       # runner 上没有预装，缺了它会 import 失败，而 build-zig.sh 带 set -e，
       # 整个构建会直接挂在这一步。
       - name: Install Pillow
@@ -51,10 +51,15 @@ jobs:
           $fs.Position = $pe + 24
           if ($br.ReadUInt16() -ne 0x020b) { throw 'not PE32+' }
 
-          # Walk the section table for .rsrc. tools/make-rsrc.py packs the eight
-          # icon sizes in there (~254 KB); a build that skipped it - python or
+          # Walk the section table for .rsrc. tools/make-rsrc.py packs the twelve
+          # icon sizes in there (~279 KB); a build that skipped it - python or
           # Pillow missing - has no .rsrc at all, which is easy to miss because
           # the exe still runs. Catch it here.
+          #
+          # This only proves the resources are present, not that the group
+          # directory is laid out right -- a wrong entry stride still yields a
+          # full-size .rsrc and an icon that merely looks blurry. make-rsrc.py
+          # asserts the stride itself.
           $fs.Position = $pe + 6
           $sections = $br.ReadUInt16()
           $fs.Position = $pe + 4 + 16

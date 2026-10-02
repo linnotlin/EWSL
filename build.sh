@@ -82,5 +82,19 @@ set -x
 "$CXX" "${CPPFLAGS[@]}" "${CXXFLAGS[@]}" -o "$OUT" "${SRCS[@]}" "${LDFLAGS[@]}" "${LDLIBS[@]}"
 set +x
 
+# icon.jpg -> RT_ICON + RT_GROUP_ICON, patched into the .rsrc section by
+# tools/make-rsrc.py. Same step build-zig.sh runs; without it the exe comes out
+# with a default blank icon and the taskbar button reads as an empty square.
+if command -v python >/dev/null 2>&1; then
+    if ! python tools/make-rsrc.py "$OUT"; then
+        echo "error: tools/make-rsrc.py failed (it needs Pillow)" >&2
+        echo "  python -m pip install pillow" >&2
+        exit 1
+    fi
+else
+    echo "warning: python not found - skipping icon resources" >&2
+    echo "  $OUT will build without an icon. Install python + pillow to embed it." >&2
+fi
+
 ls -lh "$OUT"
 echo "built: $OUT"

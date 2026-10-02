@@ -18,9 +18,14 @@ LDLIBS   := -lgdi32 -luser32 -lkernel32 -lgdiplus -ldwmapi -lole32 -lshell32 \
 
 all: $(OUT)
 
-$(OUT): $(SRCS) $(HDRS)
+$(OUT): $(SRCS) $(HDRS) icon.jpg tools/make-rsrc.py
 	@mkdir -p $(dir $(OUT))
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $(SRCS) $(LDFLAGS) $(LDLIBS)
+	@if command -v python >/dev/null 2>&1; then \
+	    python tools/make-rsrc.py $@; \
+	else \
+	    echo "warning: python not found - $@ will have no icon"; \
+	fi
 
 clean:
 	rm -rf dist

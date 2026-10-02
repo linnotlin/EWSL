@@ -8,10 +8,20 @@ RT_ICON = 3
 # (LoadIconW / PrivateExtractIconsW / SHGetFileInfoW) find nothing.
 RT_GROUP_ICON = 14
 
-# Dense ladder so Windows never has to scale an icon at 100/125/150/200% DPI
-# (taskbar, Alt+Tab, title-bar caption, Explorer list/detail all hit a native
-# size instead of upscaling a 32px bitmap, which is what looked blurry).
-SIZES = (256, 128, 96, 64, 48, 32, 24, 16)
+# Every size the shell can ask for, so nothing is ever rescaled on the way in.
+#
+# The shell requests SM_CXSMICON (16) for captions and SM_CXICON (32) for the
+# taskbar and Alt+Tab, both multiplied by the display scale. That makes the real
+# requests 16/20/24/28/32 for small and 32/40/48/56/64 for large across
+# 100/125/150/175/200% -- so 20 and 40 are what a 125% display, the commonest
+# laptop setting, asks for.
+#
+# The previous ladder (16/24/32/48/64/96/128/256) had neither. LookupIconId
+# FromDirectoryEx walks the directory and rounds a request *up* to the first
+# entry that fits, so 40 found the 48px frame and CreateIconFromResourceEx then
+# rescaled 48 -> 40 with a box filter -- that rescale, not the artwork, is what
+# made the taskbar button look smeared next to icons that ship a native 40.
+SIZES = (256, 128, 96, 64, 56, 48, 40, 32, 28, 24, 20, 16)
 
 
 def dib_bytes(im):
@@ -91,34 +101,48 @@ def split_ico(ico):
 def build_group(images):
     """Build the RT_GROUP_ICON payload.
 
-    In the PE resource model the group is just an ICONDIR followed by
-    ICONDIRENTRYs whose `imageOffset` field is repurposed to hold the RT_ICON
-    resource *id* (1..n) -- NOT a byte offset into embedded data. The actual
-    image bytes live in the separate RT_ICON resources, so the group carries no
-    image payload of its own.
+    A resource group is a GRPICONDIR followed by GRPICONDIRENTRYs, and those are
+    NOT the ICONDIRENTRYs a .ico file uses. They differ in exactly one field:
+    an .ico entry ends with a 4-byte dwImageOffset, while a group entry ends
+    with a 2-byte nID holding the RT_ICON resource id. So a group entry is 14
+    bytes where an .ico entry is 16.
 
-    Entries are written smallest-first on purpose. LookupIconIdFromDirectoryEx
-    walks the directory and hands back the first entry that is at least as
-    large as the request; with the biggest frame listed first (which is what a
-    plain .ico normally does) every request -- 16px taskbar, 32px Alt+Tab --
-    resolves to the 256px PNG, and scaling that down through
-    CreateIconFromResourceEx yields garbage: only the top sliver of the artwork
-    survives and the rest of the icon comes out blank. Ascending order makes
-    each request land on its exact frame.
+    Writing the .ico layout here (which this function used to do) leaves every
+    entry past the first out of phase: the loader walks the directory in 14-byte
+    steps while the data sits 16 bytes apart, so from the second entry on it
+    reads bWidth out of the previous entry's id and the sizes come back as
+    nonsense. The visible symptom is LookupIconIdFromDirectoryEx answering 32,
+    40, 48 and 64 px requests all with the same id -- the shell then rescales
+    that one frame for every slot, and the rescaled frame is what looked smeared
+    next to icons that ship the right size.
 
-    The RT_ICON ids stay tied to the original (largest-first) index so the ids
-    written here keep matching the resources emitted by main().
+    Entries go smallest-first on purpose. LookupIconIdFromDirectoryEx returns
+    the first entry at least as large as the request, so listing the biggest
+    frame first (what a plain .ico normally does) sent every request to the
+    256px PNG.
+
+    The ids keep the original largest-first index so they still match the
+    RT_ICON resources main() emits.
     """
     out = bytearray(struct.pack('<HHH', 0, 1, len(images)))
     for i in sorted(range(len(images)), key=lambda k: images[k][0]):
         size, payload = images[i]
-        sz = 0 if size >= 256 else size  # 0 means 256 in an ICONDIRENTRY
+        sz = 0 if size >= 256 else size  # 0 means 256 in a group entry
         # PIL stores PNG images with planes=0/bpp=0 and DIBs with planes=1/bpp=32;
         # mirror the original entry's planes/bpp so the loader decodes correctly.
         pl = 0 if payload[:8].startswith(b'\x89PNG') else 1
         bpp = 0 if pl == 0 else 32
-        out += struct.pack('<BBBBHHII', sz, sz, 0, 0, pl, bpp,
+        # 'H' last, not 'I': GRPICONDIRENTRY.nID is a WORD, so the entry is 14
+        # bytes. See the docstring for what a 4-byte id breaks.
+        out += struct.pack('<BBBBHHIH', sz, sz, 0, 0, pl, bpp,
                            len(payload), i + 1)
+    # The loader walks this in 14-byte steps. If the stride ever drifts again
+    # every entry past the first reads its neighbour's bytes, and the only
+    # symptom is an icon that resolves to the wrong frame and looks blurry --
+    # nothing crashes, so assert the layout here instead of finding out later.
+    if len(out) != 6 + 14 * len(images):
+        raise AssertionError('RT_GROUP_ICON entries must be 14 bytes, got %d'
+                             % ((len(out) - 6) // max(1, len(images))))
     return bytes(out)
 
 

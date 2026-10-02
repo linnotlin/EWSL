@@ -1416,6 +1416,58 @@ if (lw > cap) lw = cap;
 这一轮补 `lang.cpp` 时才发现——照原样链接会缺 `WinHttp*` 与注册表符号，`-lwinhttp`
 `-ladvapi32` 也没加。现在两份的源文件表和链接库都与 `build-zig.sh` 对齐。
 
+## 20. 任务栏图标仍然模糊
+
+上一轮把图标修到「能显示」之后，用户又发来一张截图：任务栏里的 EWSL 按钮比旁边
+文件夹、Edge、微信的图标明显糊一圈。这次不是排序问题。
+
+### 1. 目录从第二条起就错位
+
+对着最终产物量：请求 32 / 40 / 48 / 64 px 时，`LookupIconIdFromDirectoryEx`
+**全部**返回同一个 id（5，也就是 56 px 那帧）。系统于是把这个 56 px 帧缩到 40 px
+画进任务栏——缩放本身才是糊的来源。
+
+根因在 `tools/make-rsrc.py` 的 `build_group()`。它按 .ico 文件的 `ICONDIRENTRY`
+布局写资源目录：
+
+```python
+out += struct.pack('<BBBBHHII', sz, sz, 0, 0, pl, bpp, len(payload), i + 1)
+```
+
+但 `RT_GROUP_ICON` 用的是 `GRPICONDIRENTRY`，两者只差最后一个字段：.ico 是 4 字节
+`dwImageOffset`，资源目录是 2 字节 `nID`。也就是说资源目录每条是 **14 字节，不是
+16 字节**。
+
+按 16 字节写、系统按 14 字节读，从第二条开始就错位：`bWidth` 读到的是上一条 `nID`
+的字节，尺寸全是乱的。第一条恰好还能读对（`nID` 的小端低字节），这就是为什么
+16 px 请求一直正常、而更大的尺寸全都撞到同一帧。
+
+改一个字段宽度：
+
+```python
+out += struct.pack('<BBBBHHIH', sz, sz, 0, 0, pl, bpp, len(payload), i + 1)
+```
+
+### 2. 尺寸阶梯缺 20 / 40
+
+`LookupIconIdFromDirectoryEx` 取的是**最接近**请求的条目。原来那套
+16/24/32/48/64/96/128/256 里没有 20 也没有 40——而 125% 缩放（笔记本最常见的
+比例）任务栏正好要 40 px。补上 20 / 28 / 40 / 56 之后：
+
+| 请求尺寸（100/125/150/175/200%） | 修复前 | 修复后 |
+|---|---|---|
+| 16 / 20 / 24 / 28 / 32（标题栏、Alt+Tab 小图标） | 16 或 56 | 全部原生 |
+| 32（任务栏 100%） | 56 | 32 |
+| 40（任务栏 125%） | 56 | 40 |
+| 48（任务栏 150%） | 56 | 48 |
+| 56（任务栏 175%） | 56 | 56 |
+| 64（任务栏 200%） | 56 | 64 |
+
+验证方式是真调 API，不是查表：脚本用 `LoadLibraryExW(..., LOAD_LIBRARY_AS_DATAFILE)`
+打开 `dist/EWSL.exe`，取 `RT_GROUP_ICON`，对每个尺寸调
+`LookupIconIdFromDirectoryEx`，再拿返回的 id 去 `find` 对应的 `RT_ICON`，比它的
+`biWidth` 是否等于请求值。修复前 8 个请求里 7 个对不上。
+
 ## 验证状态
 
 | 检查项 | 结果 |
