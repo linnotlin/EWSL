@@ -68,7 +68,7 @@ set -x
 "$ZIG" c++ "${FLAGS[@]}" -o "$OUT" "${SRCS[@]}" "${LDFLAGS[@]}" "${LIBS[@]}"
 set +x
 
-# icon.png -> RT_ICON + RT_GROUP_ICON, patched straight into the .rsrc
+# icon.jpg -> RT_ICON + RT_GROUP_ICON, patched straight into the .rsrc
 # section by tools/make-rsrc.py (embedding a hand-written .res through lld
 # truncates the icon group, so we write the resource tree ourselves instead).
 if command -v python >/dev/null 2>&1; then

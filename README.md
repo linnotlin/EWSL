@@ -171,7 +171,7 @@ ZIG=/path/to/zig ./build-zig.sh
 # -> dist/EWSL.exe
 ```
 
-`build-zig.sh` 最后会调 `tools/make-rsrc.py` 把 `icon.png` 转成 8 档 `RT_ICON`
+`build-zig.sh` 最后会调 `tools/make-rsrc.py` 把 `icon.jpg` 转成 8 档 `RT_ICON`
 加一个 `RT_GROUP_ICON`，直接写进 PE 的 `.rsrc` 节（embedding 一个手写的 `.res`
 会让 lld 截断图标组，所以自己拼资源树）。
 
@@ -201,7 +201,7 @@ src/
   fs.cpp        文件读写与编码识别
 tools/
   verify.cpp    真机回归工具（见下）
-  make-rsrc.py  icon.png -> PE 资源节
+  make-rsrc.py  icon.jpg -> PE 资源节
 ```
 
 ## 验证

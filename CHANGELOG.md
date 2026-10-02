@@ -666,9 +666,9 @@ double act = 1.0 - ::fabs(m_aNavPill - (double)i);
 | **0.5** | `(126,187,250)` **中间色** | `(126,187,250)` **中间色** |
 | 1 | `(242,242,245)` 普通白 | `(10,132,255)` 完全激活蓝 |
 
-### 3. 应用图标（icon.png → exe 资源）
+### 3. 应用图标（icon.jpg → exe 资源）
 
-`icon.png` 放在项目根目录，`build-zig.sh` 每次构建前调用
+`icon.jpg` 放在项目根目录，`build-zig.sh` 每次构建前调用
 `tools/make-res.py` 生成 `tools/icon.res`，再一起交给 Zig 链接：
 
 ```
@@ -1094,7 +1094,7 @@ BitBlt(mem, l + ox, t, r - l, b - t, lay, l, t, SRCCOPY);   // ox 只在这里�
 ### 4. 清理
 
 排查期产生的一次性探针、编译产物与调试截图（约 110 MB）已经删掉，项目从
-119 MB 回到 8.4 MB，只留 `src/`、构建脚本、`icon.png`、`docs/` 与 `tools/`
+119 MB 回到 8.4 MB，只留 `src/`、构建脚本、`icon.jpg`、`docs/` 与 `tools/`
 里两个还在用的工具。
 
 ## 17. EWSL 品牌 / 浅色终端 / 去掉 Tab 宽度 / 设置页右栏卡片 / 字号行字体
@@ -1277,6 +1277,22 @@ prep: [480,256,2400,1448] 1920x1192 (work 2880x1704@0,0)
 落点只要越过工作区边界就会追加 `** OFF WORK AREA **`，这类失败不会再无声无息。
 修完重跑默认模式，16 张抓图全部 100% 有内容。
 
+### 7. 图标文件改名成 icon.jpg
+
+`icon.png` 的名字一直骗人——它的实际内容是 JPEG（1080×1080 的渐变图，`ff d8 ff e0
+00 10 JFIF` 开头）。`tools/make-rsrc.py` 走 `PIL.Image.open()`，按文件头嗅探格式，
+所以构建从来没出错，就这么一路留下来了。
+
+公开仓库里这种名字不该留着，于是改成 `icon.jpg`，`make-rsrc.py` / `build-zig.sh`
+注释 / 本文件里的引用一并更新。**没有转成真 PNG**：同一张图重编码成 PNG 是 917 KB，
+而 JPEG 只有 158 KB，改名的代价是 0，转格式的代价是仓库体积翻倍。
+
+### 8. 工作流显式声明写权限
+
+`.github/workflows/build.yml` 补上 `permissions: contents: write`。新仓库给
+`GITHUB_TOKEN` 的默认权限是只读，不显式声明的话，tag 触发那一档的
+`softprops/action-gh-release` 会因为没有写权限而失败。
+
 ## 验证状态
 
 | 检查项 | 结果 |
@@ -1319,7 +1335,7 @@ prep: [480,256,2400,1448] 1920x1192 (work 2880x1704@0,0)
 | 设置页右侧说明卡 | **通过** —— 真机抓图（浅 / 深两套）：Arch 三条命令，窗口够宽靠右、窄了自动下堆（`docs/ui-settings.png`、`docs/ui-settings-dark.png`） |
 | Tab 宽度设置已移除 | **通过** —— `src/` 内 `UI_SET_TAB_*` / `setTab*` / `tabWidth` 仅剩编辑器内部那一个只读 getter；设置页 6 行、槽位整体上移一格 |
 | 字号行不再按终端字号渲染 | **通过** —— 真机抓图（界面字号 16 / 终端字号 39）：两行数值串都是界面字号，「Aa」预览各自用界面字体（16 px）与终端字体（39 px）；Arch 三条命令改用固定界面等宽字号，卡片不再被撑爆。深色 + 双 14 px、窄窗 900×720 两套同样通过（`docs/ui-settings.png`、`docs/ui-settings-dark.png`、`docs/ui-settings-narrow.png`） |
-| 应用图标（icon.png） | **通过** —— `.res` 手工生成后 lld 正常解析，`FindResource`/`LoadResource` 取到 158733 字节 ICONDIR 资源；`dist/EWSL.exe` 的 `.rsrc` 节含 `RT_ICON`（type 3 → name 1 → lang 1033） |
+| 应用图标（icon.jpg） | **通过** —— `.res` 手工生成后 lld 正常解析，`FindResource`/`LoadResource` 取到 158733 字节 ICONDIR 资源；`dist/EWSL.exe` 的 `.rsrc` 节含 `RT_ICON`（type 3 → name 1 → lang 1033）。源图是 JPEG 容器，`make-rsrc.py` 按文件头嗅探而不看扩展名 |
 | 标题栏发行版按钮可点 | **通过** —— 真机投递点击：完整「已安装 / 可安装」浮层弹出（`docs/ui-distro-menu.png`）；修前只得到一次空点击 |
 | 设置页不再含个人信息 | **通过** —— 全仓库检索联系方式字面量，`src/` 命中数为 0 |
 | 窗口落在工作区内 | **通过** —— 默认模式抓图落点 `[480,256,2400,1448] 1920x1192`，工作区 `2880x1704@0,0`，四边都在界内（192 dpi 屏幕，即 200% 缩放） |

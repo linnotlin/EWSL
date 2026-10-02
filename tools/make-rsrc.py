@@ -257,7 +257,7 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(here)
     target = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, 'dist', 'EWSL.exe')
-    raw = io.open(os.path.join(root, 'icon.png'), 'rb').read()
+    raw = io.open(os.path.join(root, 'icon.jpg'), 'rb').read()
 
     ico = build_ico(raw)
     images = split_ico(ico)

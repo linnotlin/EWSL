@@ -7,6 +7,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 新仓库给 GITHUB_TOKEN 的默认权限是只读，不显式要写权限的话，
+# tag 触发那一档的 action-gh-release 会 403。
+permissions:
+  contents: write
+
 jobs:
   windows:
     runs-on: windows-latest
