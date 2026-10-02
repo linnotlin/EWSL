@@ -72,7 +72,17 @@ set +x
 # section by tools/make-rsrc.py (embedding a hand-written .res through lld
 # truncates the icon group, so we write the resource tree ourselves instead).
 if command -v python >/dev/null 2>&1; then
-    python tools/make-rsrc.py "$OUT"
+    # make-rsrc.py needs Pillow. Failing here beats shipping an exe with no icon:
+    # this script runs under set -e, so a non-zero exit stops the build, and the
+    # message below is the whole diagnosis.
+    if ! python tools/make-rsrc.py "$OUT"; then
+        echo "error: tools/make-rsrc.py failed (it needs Pillow)" >&2
+        echo "  python -m pip install pillow" >&2
+        exit 1
+    fi
+else
+    echo "warning: python not found - skipping icon resources" >&2
+    echo "  $OUT will build without an icon. Install python + pillow to embed it." >&2
 fi
 
 ls -lh "$OUT"

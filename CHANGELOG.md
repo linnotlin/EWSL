@@ -1293,6 +1293,34 @@ prep: [480,256,2400,1448] 1920x1192 (work 2880x1704@0,0)
 `GITHUB_TOKEN` 的默认权限是只读，不显式声明的话，tag 触发那一档的
 `softprops/action-gh-release` 会因为没有写权限而失败。
 
+### 9. 修掉首次 CI 失败
+
+第一次推送后 Actions 挂红：`mlugg/setup-zig` 装好 Zig 0.14.1，`Build` 这一步却退出
+非零。原因是 `tools/make-rsrc.py` 依赖 **Pillow**，而 runner 上没预装：
+
+```
+ModuleNotFoundError: No module named 'PIL'
+```
+
+`build-zig.sh` 开头是 `set -euo pipefail`，这一句失败会把整个脚本带崩。本机之所以
+一直没暴露，是因为本机装了 Pillow。
+
+修法三处：
+
+- 工作流加一个 `python -m pip install pillow` 步骤，并写明为什么；
+- `build-zig.sh` 里把调用改成显式判错，失败时打印「需要 Pillow / 怎么装」再退出，
+  而不是抛一段 Python traceback 就没了；
+- `README.md` 的「自己构建」补上这个依赖。
+
+顺带把工作流里的 `./build-zig.sh` 改成 `bash ./build-zig.sh`：Windows runner 上
+checkout 出来的文件没有可执行位，显式指定解释器省掉一类偶发失败。
+
+还有一处是顺手补的：那个 `Verify PE structure and icon resources` 步骤名字里写着
+icon resources，实际只查了 PE 头和 machine，图标缺失根本验不出来。现在真的去走
+section 表找 `.rsrc` 并断言它够大 —— make-rsrc.py 往里面塞了 8 档图标共 254 304
+字节，而跳过图标那一步的产物**整个 `.rsrc` 节都不存在**（实测 `_noicon.exe` 读出来
+是 0），所以这条断言正好卡在这个回归上。
+
 ## 验证状态
 
 | 检查项 | 结果 |

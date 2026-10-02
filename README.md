@@ -162,18 +162,21 @@ EWSL.exe --help           帮助
 
 ## 自己构建
 
-依赖只有 **zig**（自带 mingw-w64 头文件和导入库），不需要装 MinGW，也不需要 MSVC：
+依赖只有 **zig**（自带 mingw-w64 头文件和导入库），不需要装 MinGW，也不需要 MSVC；
+图标那一步额外需要 **Python + Pillow**：
 
 ```bash
 git clone https://github.com/IOSLIN-dev/EWSL.git
 cd EWSL
+python -m pip install pillow        # 只为生成图标资源，可跳过
 ZIG=/path/to/zig ./build-zig.sh
 # -> dist/EWSL.exe
 ```
 
 `build-zig.sh` 最后会调 `tools/make-rsrc.py` 把 `icon.jpg` 转成 8 档 `RT_ICON`
 加一个 `RT_GROUP_ICON`，直接写进 PE 的 `.rsrc` 节（embedding 一个手写的 `.res`
-会让 lld 截断图标组，所以自己拼资源树）。
+会让 lld 截断图标组，所以自己拼资源树）。本机没有 Python 时脚本会打印一条警告
+并跳过，产物没有图标但能正常跑。
 
 如果本机已经有 MinGW-w64，也可以用 `make`：
 

@@ -22,10 +22,17 @@ jobs:
         with:
           version: 0.14.1
 
+      # tools/make-rsrc.py 用 Pillow 把 icon.jpg 重编码成 8 档 RT_ICON。
+      # runner 上没有预装，缺了它会 import 失败，而 build-zig.sh 带 set -e，
+      # 整个构建会直接挂在这一步。
+      - name: Install Pillow
+        shell: bash
+        run: python -m pip install --disable-pip-version-check pillow
+
       - name: Build
         shell: bash
         run: |
-          ZIG=zig ./build-zig.sh
+          ZIG=zig bash ./build-zig.sh
           ls -l dist/
 
       - name: Verify PE structure and icon resources
@@ -43,8 +50,27 @@ jobs:
           if ($br.ReadUInt16() -ne 0x8664) { throw 'not x86_64' }
           $fs.Position = $pe + 24
           if ($br.ReadUInt16() -ne 0x020b) { throw 'not PE32+' }
+
+          # Walk the section table for .rsrc. tools/make-rsrc.py packs the eight
+          # icon sizes in there (~254 KB); a build that skipped it - python or
+          # Pillow missing - has no .rsrc at all, which is easy to miss because
+          # the exe still runs. Catch it here.
+          $fs.Position = $pe + 6
+          $sections = $br.ReadUInt16()
+          $fs.Position = $pe + 4 + 16
+          $optSize = $br.ReadUInt16()
+          $fs.Position = $pe + 4 + 20 + $optSize
+          $rsrc = 0
+          for ($i = 0; $i -lt $sections; $i++) {
+            $name = [Text.Encoding]::ASCII.GetString($br.ReadBytes(8)).Trim([char]0)
+            $fs.Position += 8                       # VirtualSize, VirtualAddress
+            $raw = $br.ReadUInt32()                 # SizeOfRawData
+            $fs.Position += 20
+            if ($name -eq '.rsrc') { $rsrc = $raw }
+          }
           $fs.Close()
-          "size = $((Get-Item $exe).Length) bytes"
+          if ($rsrc -lt 100000) { throw ".rsrc is ${rsrc} bytes - icon resources did not get embedded" }
+          "size = $((Get-Item $exe).Length) bytes, .rsrc = $rsrc bytes, sections = $sections"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
