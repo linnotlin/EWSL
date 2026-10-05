@@ -87,6 +87,10 @@ private:
     int     m_bufH;
 
     int m_cellW;
+    // 本帧真正能画下的列数（按可绘制像素宽 / cellW 算）。
+    // 与 term.cols() 可能差一列：cols 是外部按估计的宽度算的，而这里
+    // 用的是渲染时拿到的真实像素宽。有了它，TextOutW 不会把字画到窗口外。
+    int m_limitCols;
     int m_cellH;
     int m_baseY;
     int m_latinAscent;

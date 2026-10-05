@@ -10,6 +10,9 @@
 #include <windows.h>
 
 #include <cstring>
+#include <cwchar>
+
+#include "lang.h"
 
 namespace wslterm {
 
@@ -61,6 +64,100 @@ bool wslAvailable() {
     return !findWslExe().empty();
 }
 
+// 组件状态不能靠 GetWindowsOptionalFeature 读，那需要管理员 + 慢。正经做法是
+// 问 WSL 自己：`wsl.exe --status` 在组件被禁用时返回非 0，而且不会像 --help
+// 那样把帮助文本打到 stdout，所以不会污染调用方的解析。
+//
+// 但 --status 在「Store 版 WSL 未安装、只有 inbox 版」时同样返回非 0，两者要
+// 区分开：Store 版有 C:\Program Files\WSL\wsl.exe，inbox 版没有。
+static bool storeWslPresent() {
+    WCHAR buf[MAX_PATH];
+
+    if (GetEnvironmentVariableW(L"ProgramW6432", buf, MAX_PATH)) {
+        std::wstring p = std::wstring(buf) + L"\\WSL\\wsl.exe";
+        if (realExe(p)) return true;
+    }
+    if (GetEnvironmentVariableW(L"ProgramFiles", buf, MAX_PATH)) {
+        std::wstring p = std::wstring(buf) + L"\\WSL\\wsl.exe";
+        if (realExe(p)) return true;
+    }
+    return false;
+}
+
+bool wslComponentEnabled() {
+    std::wstring exe = findWslExe();
+    if (exe.empty()) return false;
+
+    DWORD code = (DWORD)-1;
+    runCaptureExit(L"\"" + exe + L"\" --status", 10000, &code);
+    return code == 0;
+}
+
+bool wslVirtualMachineEnabled() {
+    // vmcompute 服务是 VirtualMachinePlatform 带进来的。读服务状态不需要管理员。
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return false;
+
+    bool on = false;
+    SC_HANDLE s = OpenServiceW(scm, L"vmcompute", SERVICE_QUERY_STATUS);
+    if (s) {
+        SERVICE_STATUS st;
+        memset(&st, 0, sizeof(st));
+        if (QueryServiceStatus(s, &st)) on = (st.dwCurrentState != SERVICE_STOPPED);
+        CloseServiceHandle(s);
+    }
+    CloseServiceHandle(scm);
+    return on;
+}
+
+static WslState g_state = WSL_UNKNOWN;
+
+WslState wslState() {
+    if (g_state != WSL_UNKNOWN) return g_state;
+
+    if (findWslExe().empty()) {
+        g_state = WSL_NO_EXE;
+        return g_state;
+    }
+
+    if (wslComponentEnabled()) {
+        g_state = WSL_READY;
+        return g_state;
+    }
+
+    // 组件没启用。再分一次：Store 版缺失说明这台机器压根没装过 WSL 包。
+    if (!storeWslPresent()) {
+        g_state = WSL_NO_COMPONENT;
+    } else if (!wslVirtualMachineEnabled()) {
+        g_state = WSL_NO_VMP;
+    } else {
+        g_state = WSL_NO_COMPONENT;
+    }
+    return g_state;
+}
+
+void resetWslState() {
+    g_state = WSL_UNKNOWN;
+}
+
+std::wstring wslStateLabel() {
+    switch (wslState()) {
+    case WSL_READY:       return L"WSL_READY";
+    case WSL_NO_EXE:      return L"WSL_NO_EXE";
+    case WSL_NO_VMP:      return L"WSL_NO_VMP";
+    case WSL_NO_COMPONENT:return L"WSL_NO_COMPONENT";
+    default:              return L"WSL_UNKNOWN";
+    }
+}
+
+std::wstring wslEnableCommand() {
+    // inbox 版 wsl.exe 自带 --install；Store 版也有。两者都能把缺失的组件装上，
+    // 缺 VirtualMachinePlatform 时一并带上。
+    std::wstring exe = findWslExe();
+    if (exe.empty()) return L"wsl.exe --install";
+    return L"\"" + exe + L"\" --install";
+}
+
 static std::wstring utf8ToWide(const std::string& s) {
     if (s.empty()) return std::wstring();
     int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), NULL, 0);
@@ -70,23 +167,76 @@ static std::wstring utf8ToWide(const std::string& s) {
     return w;
 }
 
+// 子进程输出的编码判定。
+//
+// inbox wsl.exe 在组件被禁用 / 出错时把消息按 UTF-16LE 写进 stdout，而
+// 「中文的 UTF-16 字节里一个 0x00 都没有」（「安装」= 89 5B C5 88），所以
+// 不能只数零字节，必须先看 UTF-8 结构是否成立。
+//
+// 奇数位零字节的比例只能当补充证据：实测 wsl.exe --help 的比例是 0.809，
+// 离0.80 的阈值只差 0.009，输出里中文一多就掉到阈值以下被误判成 UTF-8。
+// 所以阈值放到 0.75，并且要求 UTF-8 结构非法时才认UTF-16——两条判据
+// 互相独立，不会因为某一段输出偏中文就整体翻车。
+static int scanUtf8Strict(const unsigned char* b, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = b[i];
+        int need;
+        unsigned char lo, hi;
+
+        if (c < 0x80) { ++i; continue; }
+        else if (c >= 0xC2 && c <= 0xDF) { need = 1; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xE0)               { need = 2; lo = 0xA0; hi = 0xBF; }
+        else if (c >= 0xE1 && c <= 0xEC)  { need = 2; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xED)               { need = 2; lo = 0x80; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF)  { need = 2; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xF0)               { need = 3; lo = 0x90; hi = 0xBF; }
+        else if (c >= 0xF1 && c <= 0xF3)  { need = 3; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xF4)               { need = 3; lo = 0x80; hi = 0x8F; }
+        else return 1;                // 0x80..0xC1 / 0xF5..0xFF 非法
+
+        if (i + (size_t)need >= n) break;         // 尾部截断，判不了也不算错
+        for (int k = 1; k <= need; ++k) {
+            unsigned char t = b[i + (size_t)k];
+            if (t < lo || t > hi) return 1;
+        }
+        i += (size_t)need + 1;
+    }
+    return 0;
+}
+
 static std::wstring decodeOutput(const std::string& raw) {
     if (raw.empty()) return std::wstring();
 
+    const unsigned char* b = (const unsigned char*)raw.data();
+    size_t n = raw.size();
     size_t off = 0;
     bool utf16 = false;
 
-    if (raw.size() >= 2 && (unsigned char)raw[0] == 0xFF && (unsigned char)raw[1] == 0xFE) {
+    if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
         utf16 = true;
         off = 2;
-    } else {
-        size_t pairs = 0;
-        size_t zeros = 0;
-        for (size_t i = 1; i < raw.size(); i += 2) {
-            ++pairs;
-            if (raw[i] == 0) ++zeros;
+    } else if (n >= 2 && b[0] == 0xFE && b[1] == 0xFF) {
+        // BE BOM罕见，转成 LE 字节序再按 UTF-16 读。
+        std::wstring w;
+        for (size_t i = 2; i + 1 < n; i += 2) {
+            w.push_back((wchar_t)(((uint32_t)b[i] << 8) | b[i + 1]));
         }
-        if (pairs >= 4 && zeros * 10 >= pairs * 8) utf16 = true;
+        return w;
+    } else {
+        size_t pairs = 0, zeros = 0;
+        for (size_t i = 1; i < n; i += 2) {
+            ++pairs;
+            if (b[i] == 0x00) ++zeros;
+        }
+
+        // UTF-8 结构非法 -> 一定是 UTF-16（纯 CJK 的 UTF-16 逐字节看全是
+        // 合法 ASCII，只有结构判定能把它们摘出来）。
+        if (scanUtf8Strict(b, n) != 0) {
+            utf16 = true;
+        } else if (pairs >= 4 && zeros * 4 >= pairs * 3) {
+            utf16 = true;
+        }
     }
 
     if (!utf16) return utf8ToWide(raw);
@@ -112,7 +262,8 @@ static DWORD WINAPI readAll(LPVOID p) {
     return 0;
 }
 
-std::wstring runCapture(const std::wstring& cmdline, unsigned timeoutMs) {
+std::wstring runCaptureExit(const std::wstring& cmdline, unsigned timeoutMs, DWORD* exitCode) {
+    if (exitCode) *exitCode = (DWORD)-1;
     if (cmdline.empty()) return std::wstring();
 
     SECURITY_ATTRIBUTES sa;
@@ -156,7 +307,10 @@ std::wstring runCapture(const std::wstring& cmdline, unsigned timeoutMs) {
     HANDLE th = CreateThread(NULL, 0, readAll, ctx, 0, NULL);
 
     DWORD w = WaitForSingleObject(pi.hProcess, timeoutMs);
-    if (w == WAIT_TIMEOUT) TerminateProcess(pi.hProcess, 1);
+    if (w == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        if (exitCode) *exitCode = (DWORD)-1;
+    }
 
     if (th) {
         WaitForSingleObject(th, 5000);
@@ -165,12 +319,21 @@ std::wstring runCapture(const std::wstring& cmdline, unsigned timeoutMs) {
 
     std::wstring out = decodeOutput(ctx->data);
 
+    if (exitCode && w != WAIT_TIMEOUT) {
+        DWORD code = 0;
+        if (GetExitCodeProcess(pi.hProcess, &code)) *exitCode = code;
+    }
+
     delete ctx;
     CloseHandle(outRead);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
     return out;
+}
+
+std::wstring runCapture(const std::wstring& cmdline, unsigned timeoutMs) {
+    return runCaptureExit(cmdline, timeoutMs, NULL);
 }
 
 static std::wstring trimW(const std::wstring& s) {
@@ -538,6 +701,203 @@ std::vector<DistroStatus> listDistroStatus() {
     }
 
     return out;
+}
+
+
+// ---------------------------------------------------------------- WSLg
+//
+// msrdc.exe /wslg 是 WSLg（Linux 图形界面）的显示通道，父进程是 wslhost。
+// 每当 WSL 启动它就被拉起来，所以它一出问题就是无限弹窗。
+//
+// 这里只做两件事：判断它坏了没有，以及往 .wslconfig 写 guiApplications=false。
+// 不去动 C:\Program Files\WSL 下的任何文件 —— rdclientax.dll 虽然加载失败，
+// 但它是必需文件，删了会让 WSLg 彻底起不来（连带正常功能一起坏）。
+
+static std::wstring wslDir() {
+    WCHAR buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"ProgramFiles", buf, MAX_PATH);
+    if (!n || n >= MAX_PATH) return std::wstring();
+    return std::wstring(buf) + L"\\WSL";
+}
+
+static std::wstring wslConfigPath() {
+    WCHAR buf[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
+    if (!n || n >= MAX_PATH) return std::wstring();
+    return std::wstring(buf) + L"\\.wslconfig";
+}
+
+// rdclientax.dll 装不上，主因通常是系统文件版本与 Build 号不匹配：
+// 它要 KERNEL32!GetTempPath2W，老一些的累积更新里没这个导出，于是 127。
+// 文件大小不能作为依据（实测踩过：13MB 完好无损，一样导不进来）。
+static bool rdclientaxLoadable() {
+    std::wstring dir = wslDir();
+    if (dir.empty()) return false;
+    std::wstring dll = dir + L"\\rdclientax.dll";
+    if (!fileExistsW(dll)) return false;
+
+    // 不用 SetDllDirectoryW：它改的是整个进程的搜索路径，而 wsl.cpp 别处还要
+    // 跑子进程，状态留着不安全。绝对路径 + LOAD_WITH_ALTERED_SEARCH_PATH
+    // 只影响这一次加载。
+    HMODULE h = LoadLibraryExW(dll.c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!h) return false;
+    FreeLibrary(h);
+    return true;
+}
+
+static bool readAllW(const std::wstring& path, std::string& outData) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER li;
+    if (!GetFileSizeEx(f, &li) || li.QuadPart > 64 * 1024) {
+        CloseHandle(f);
+        return false;
+    }
+    DWORD want = (DWORD)li.QuadPart;
+    std::string buf;
+    buf.resize(want);
+    DWORD got = 0;
+    BOOL ok = ReadFile(f, want ? &buf[0] : NULL, want, &got, NULL);
+    CloseHandle(f);
+    if (!ok) return false;
+    buf.resize(got);
+    outData.swap(buf);
+    return true;
+}
+
+static bool writeAllW(const std::wstring& path, const std::string& data) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                           NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    BOOL ok = WriteFile(f, data.empty() ? NULL : data.data(),
+                        (DWORD)data.size(), &put, NULL);
+    CloseHandle(f);
+    return ok && put == data.size();
+}
+
+static std::string wslConfigText() {
+    std::wstring p = wslConfigPath();
+    if (p.empty()) return std::string();
+    std::string utf8;
+    if (!readAllW(p, utf8)) return std::string();
+    return utf8;
+}
+
+static void lowerAscii(std::string& s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] >= 'A' && s[i] <= 'Z') s[i] = (char)(s[i] - 'A' + 'a');
+    }
+}
+
+static bool guiAppsDisabledInConfig() {
+    std::string t = wslConfigText();
+    if (t.empty()) return false;
+    lowerAscii(t);
+    return t.find("guiapplications") != std::string::npos;
+}
+
+WslgState wslgState() {
+    std::wstring dir = wslDir();
+    std::wstring msrdc = dir.empty() ? std::wstring() : dir + L"\\msrdc.exe";
+    if (msrdc.empty() || !fileExistsW(msrdc)) return WSLG_NO_DLL;
+
+    if (guiAppsDisabledInConfig()) return WSLG_OFF;
+    return rdclientaxLoadable() ? WSLG_ON : WSLG_BROKEN;
+}
+
+std::wstring wslgStateLabel() {
+    switch (wslgState()) {
+    case WSLG_OFF:return LS(L"已关闭");
+    case WSLG_ON: return LS(L"正常");
+    case WSLG_NO_DLL: return LS(L"未安装");
+    default:              return LS(L"加载失败，正在弹窗");
+    }
+}
+
+bool disableWslg() {
+    if (guiAppsDisabledInConfig()) return true;
+
+    std::wstring path = wslConfigPath();
+    if (path.empty()) return false;
+
+    std::string t = wslConfigText();
+
+    // CRLF：ini 解析器也认 LF，但统一 CRLF 省得跟 Notepad 里手工编辑的人打架。
+    const char* RULE = "\r\n";
+    const std::string KEY = "guiApplications=false";
+
+    size_t sec = t.find("[wsl2]");
+    std::string out;
+    if (sec == std::string::npos) {
+        // 没有 [wsl2] 段就新建一个追加在末尾。
+        out = t;
+        if (out.empty()) {
+            out = "[wsl2]";
+            out += RULE;
+        } else {
+            if (out[out.size() - 1] != '\n') out += RULE;
+            out += RULE;
+            out += "[wsl2]";
+            out += RULE;
+        }
+        out += KEY;
+        out += RULE;
+    } else {
+        // 插进 [wsl2] 段的开头。插段头而不是段尾，是为了避免插到下一个
+        // [section] 之后 —— ini 里的键归属它上面最近的段名。
+        //
+        // 落点要把段名后面的换行一起吃掉。光取 sec+7 会停在 '\r' 或 '\n' 之前，
+        // 于是插进去就成了 "[wsl2]\n\r\nguiApplications=falsememory=4GB"——
+        // 键和下一条粘成一行，WSL 解析不出这个键，配置等于没写。
+        size_t at = sec + 7;
+        while (at < t.size() && (t[at] == '\r' || t[at] == '\n')) ++at;
+        out = t.substr(0, at);
+        out += KEY;
+        out += RULE;
+        out += t.substr(at);
+    }
+
+    return writeAllW(path, out);
+}
+
+bool enableWslg() {
+    std::wstring path = wslConfigPath();
+    if (path.empty()) return false;
+
+    std::string t = wslConfigText();
+    if (t.empty()) return true;
+
+    std::string out;
+    out.reserve(t.size());
+
+    size_t i = 0;
+    while (i <= t.size()) {
+        size_t eol = t.find('\n', i);
+        std::string line = (eol == std::string::npos) ? t.substr(i)
+                                                      : t.substr(i, eol - i + 1);
+        std::string low = line;
+        lowerAscii(low);
+        // 命中「键名在等号左边」的行才删。条件写成low.find(key) < low.find('=')
+        // 的话，遇到没有 '=' 的行（npos 参与比较）会误判，所以显式分开判。
+        size_t kp = low.find("guiapplications");
+        size_t eq = low.find('=');
+        bool isKeyLine = (kp != std::string::npos) &&
+                         (eq != std::string::npos) && (kp < eq);
+        if (!isKeyLine) out += line;
+
+        if (eol == std::string::npos) break;
+        i = eol + 1;
+    }
+    return writeAllW(path, out);
+}
+
+std::wstring wslShutdownCommand() {
+    std::wstring exe = findWslExe();
+    if (exe.empty()) return L"wsl.exe --shutdown";
+    return L"\"" + exe + L"\" --shutdown";
 }
 
 }

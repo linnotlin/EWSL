@@ -381,6 +381,8 @@ static void iconLayers(Graphics& g, REAL cx, REAL cy, REAL sc, const Color& c, R
 UiModel::UiModel()
     : page(PAGE_TERMINAL), hasTerminal(false), wslMissing(false),
       installing(false), checking(true), loadingOnline(false),
+      fixStage(0), fixTick(0), fixStartTick(0), fixElapsed(0),
+      wslg(WSLG_NO_DLL), wslgFixed(false),
       distroMenuOpen(false), hasFolder(false), editorOpen(false),
       editorDirty(false), fontSize(16), termFontSize(16), theme(0),
       terminalMode(0), activeMode(-1),
@@ -811,6 +813,25 @@ void Ui::layout(int w, int h, const UiModel& m, Geom& ge) const {
     int btnY = cyBody + (int)(56 * s + 0.5);
     ge.emptyBtn = Box{ ge.body.l + cw / 2 - btnW2, btnY,
                        ge.body.l + cw / 2 + btnW2, btnY + btnH2 };
+
+    // 启用组件时的进度条：副文案在 layout 里占 cy+16..cy+40，进度条必须让开
+    // 这段，否则文字和条压在一起（实测过，重叠 10px）。原按钮在 cy+56，
+    // 进度条比按钮矮，正好填进按钮上沿那块空档。
+    int barW = (int)(260 * s + 0.5);
+    if (barW > cw - (int)(40 * s + 0.5)) barW = cw - (int)(40 * s + 0.5);
+    if (barW < (int)(120 * s + 0.5)) barW = (int)(120 * s + 0.5);
+    int barH = (int)(8 * s + 0.5);
+    if (barH < 6) barH = 6;
+    int barY2 = cyBody + (int)(48 * s + 0.5);
+    ge.fixBar = Box{ ge.body.l + cw / 2 - barW / 2, barY2,
+                     ge.body.l + cw / 2 + barW / 2, barY2 + barH };
+
+    // 重启按钮放回原按钮的位（cy+56），只在有进度条时才有意义
+    int rbW = (int)(118 * s + 0.5);
+    int rbH = (int)(38 * s + 0.5);
+    int rbY = barY2 + (int)(barH + 14 * s + 0.5);
+    ge.fixReboot = Box{ ge.body.l + cw / 2 - rbW / 2, rbY,
+                        ge.body.l + cw / 2 + rbW / 2, rbY + rbH };
 
     ge.treeRows.clear();
     ge.treeUp = Box{ 0, 0, 0, 0 };
@@ -1664,13 +1685,141 @@ void Ui::paintEmptyState(HDC dc, const UiModel& m, const Geom& ge) {
     int subY   = cy + (int)(16 * s + 0.5);
     int subH   = (int)(24 * s + 0.5);
 
-    std::wstring title = m.wslMissing ? LS(L"未检测到 WSL") : LS(L"尚未安装 Linux 发行版");
+    // 启用组件的流程有话要说，就把按钮换成进度条。toast 只活2.6 秒，
+    // 而 wsl --install 要跑 UAC、启用系统组件，常常还要几分钟甚至要重启，
+    // 靠 toast 等于什么都没告诉用户。
+    if (m.fixStage == 1 || m.fixStage == 2 || m.fixStage == 3) {
+        bool uac = (m.fixStage == 1);
+        bool reboot = (m.fixStage == 3);
+
+        std::wstring title = uac ? LS(L"等待管理员授权")
+                        : reboot ? LS(L"需要重启系统")
+                                 : LS(L"正在启用 WSL 组件…");
+        textAt(dc, title, g_hBig, kText, B.l, titleY, B.w(), titleH, 1);
+
+        // 秒表：让用户知道程序还在跑，而不是卡死了。
+        // LS() 是查表翻译，带格式化结果的字符串查不到会原样返回中文，
+        // 所以数字单独拼，单位走翻译。
+        WCHAR secs[32];
+        wsprintfW(secs, L"%d", m.fixElapsed);
+        std::wstring clock = LS(L"已用") + std::wstring(secs) + LS(L"秒");
+
+        // 两段文案之间留个间隔符。用全角空格而不是普通空格：中文正文里
+        // 普通空格紧贴汉字会显得挤，而且它没必要进翻译表。
+        std::wstring sub = m.fixMsg.empty()
+            ? (uac ? LS(L"请在弹出的 UAC 窗口点「是」") : clock)
+            : (m.fixMsg + LS(L"　") + clock);
+        textAt(dc, sub, g_hSmall, kText2, B.l, subY, B.w(), subH, 1);
+
+        int barY = ge.fixBar.t;
+        int barH = ge.fixBar.h();
+
+        {
+            Graphics g(dc);
+            fillRound(g, ge.fixBar.l, barY, ge.fixBar.r, barY + barH,
+                      barH / 2, kTrack);
+        }
+
+        if (uac) {
+            // 不知道进度，等着就行：来回扫的高亮块表达「在等用户操作」
+            int inner = ge.fixBar.w() - barH;
+            if (inner > barH) {
+                double ph = (double)(GetTickCount() % 1500) / 1500.0;
+                int sw = barH;
+                int travel = inner + sw;
+                int sx = ge.fixBar.l + barH / 2 - sw / 2 + (int)(ph * travel);
+                int l = sx;
+                int r = sx + sw;
+                if (l < ge.fixBar.l) l = ge.fixBar.l;
+                if (r > ge.fixBar.r - barH) r = ge.fixBar.r - barH;
+                if (r > l) {
+                    Graphics g(dc);
+                    SolidBrush sb(mixColor(kTrack, kAccent, 0.75));
+                    g.FillRectangle(&sb, (REAL)l, (REAL)barY,
+                                    (REAL)(r - l), (REAL)barH);
+                }
+            }
+        } else if (reboot) {
+            int fillW = (int)(ge.fixBar.w() * 0.999 + 0.5);
+            Graphics g(dc);
+            fillRound(g, ge.fixBar.l, barY, ge.fixBar.l + fillW, barY + barH,
+                      barH / 2, kOk);
+        } else {
+            // 执行中：wsl --install 不上报百分比，只能做不确定进度。
+            // 按耗时往前推，逼近而不越过 95%，剩下的留给收尾阶段。
+            double t = (double)m.fixElapsed;
+            double pct = 8.0 + 87.0 * (1.0 - exp(-t / 75.0));
+            if (pct > 95.0) pct = 95.0;
+            int fillW = (int)((double)ge.fixBar.w() * pct / 100.0 + 0.5);
+            if (fillW > 0) {
+                Graphics g(dc);
+                fillRound(g, ge.fixBar.l, barY, ge.fixBar.l + fillW, barY + barH,
+                          barH / 2, kAccent);
+
+                // 扫光，让「还在动」这件事看得见
+                if (fillW > (int)(26 * s)) {
+                    double ph = (double)(GetTickCount() % 1400) / 1400.0;
+                    int sw = (int)(54 * s + 0.5);
+                    int sx = ge.fixBar.l + (int)(ph * (double)(fillW + sw)) - sw;
+                    int l = sx;
+                    int r = sx + sw;
+                    if (l < ge.fixBar.l) l = ge.fixBar.l;
+                    if (r > ge.fixBar.l + fillW) r = ge.fixBar.l + fillW;
+                    if (r > l) {
+                        int sv2 = SaveDC(dc);
+                        IntersectClipRect(dc, ge.fixBar.l, barY,
+                                          ge.fixBar.l + fillW, barY + barH);
+                        SolidBrush sb(Color(46, 0xFF, 0xFF, 0xFF));
+                        g.FillRectangle(&sb, (REAL)l, (REAL)barY,
+                                        (REAL)(r - l), (REAL)barH);
+                        RestoreDC(dc, sv2);
+                    }
+                }
+            }
+
+            // 百分比摆在条的右边、与条垂直居中。放在条上方会压到副文案
+            // （副文案下沿只比条上沿高 8px，字号一压就糊在一起）。
+            WCHAR pctTxt[32];
+            wsprintfW(pctTxt, L"%d%%", (int)(pct + 0.5));
+            textAt(dc, pctTxt, g_hSmall, kText3,
+                   ge.fixBar.r + (int)(8 * s), barY - (int)(3 * s),
+                   (int)(44 * s), barH + (int)(6 * s), 2);
+        }
+
+        // 组件装完必须重启才生效，这是最容易被忽略的一步，给个按钮
+        if (reboot) {
+            bool hv = (m_hoverBtn == 4);
+            {
+                Graphics g(dc);
+                fillRound(g, ge.fixReboot.l, ge.fixReboot.t,
+                          ge.fixReboot.r, ge.fixReboot.b,
+                          ge.fixReboot.h() / 2, hv ? kAccentDark : kAccent);
+            }
+            textAt(dc, LS(L"立即重启"), g_hBody, kWhite,
+                   ge.fixReboot.l, ge.fixReboot.t,
+                   ge.fixReboot.w(), ge.fixReboot.h(), 1);
+        }
+        return;
+    }
+
+    std::wstring title = m.wslMissing ? LS(L"未启用 WSL 组件") : LS(L"尚未安装 Linux 发行版");
     textAt(dc, title, g_hBig, kText, B.l, titleY, B.w(), titleH, 1);
 
-    std::wstring sub = m.wslMissing
-        ? LS(L"请先在「启用或关闭 Windows 功能」中勾选适用于 Linux 的 Windows 子系统")
-        : LS(L"点击下方按钮，或使用上方发行版菜单选择下载");
-    textAt(dc, sub, g_hSmall, kText2, B.l, subY, B.w(), subH, 1);
+    std::wstring sub;
+    if (m.wslMissing) {
+        sub = (m.wslState == WSL_NO_VMP)
+            ? LS(L"已装 WSL，但虚拟机平台未启用（WSL2 需要它）。点下方按钮一键开启。")
+            : LS(L"系统里只有 inbox 版 wsl.exe，组件没启用。点下方按钮一键开启。");
+    } else {
+        sub = LS(L"点击下方按钮，或使用上方发行版菜单选择下载");
+    }
+
+    // 上一次失败了就把原因留在这儿，别让用户干瞪眼
+    if (m.fixStage == 4 && !m.fixMsg.empty()) {
+        sub = m.fixMsg;
+    }
+    textAt(dc, sub, g_hSmall, m.fixStage == 4 ? kDanger : kText2,
+           B.l, subY, B.w(), subH, 1);
 
     bool hv = (m_hoverBtn == 4);
     {
@@ -1678,7 +1827,7 @@ void Ui::paintEmptyState(HDC dc, const UiModel& m, const Geom& ge) {
         fillRound(g, ge.emptyBtn.l, ge.emptyBtn.t, ge.emptyBtn.r, ge.emptyBtn.b,
                   ge.emptyBtn.h() / 2, hv ? kAccentDark : kAccent);
     }
-    textAt(dc, LS(L"选择发行版安装"), g_hBody, kWhite,
+    textAt(dc, m.wslMissing ? LS(L"启用 WSL 组件") : LS(L"选择发行版安装"), g_hBody, kWhite,
            ge.emptyBtn.l, ge.emptyBtn.t, ge.emptyBtn.w(), ge.emptyBtn.h(), 1);
 }
 
@@ -2919,7 +3068,22 @@ UiClick Ui::hitTest(int w, int h, int x, int y, const UiModel& m) {
 
     if (m.page == PAGE_TERMINAL) {
         if (m.instLocked) return c;
-        if (!m.hasTerminal && ge.emptyBtn.has(x, y)) c.action = UI_EMPTY_INSTALL;
+
+        // 启用流程进行中：整页不再响应启用点击，避免连点起一堆提权进程。
+        if (m.fixStage == 1 || m.fixStage == 2) return c;
+
+        // 装完了等重启：只认「立即重启」那一个按钮
+        if (m.fixStage == 3) {
+            if (ge.fixReboot.has(x, y)) c.action = UI_FIX_REBOOT;
+            return c;
+        }
+
+        if (m.wslMissing) {
+            // 原来的写法是整个终端区都算按钮，点空白处也会弹 UAC。
+            // 这里收回成只有按钮本身可点。
+            if (ge.emptyBtn.has(x, y)) c.action = UI_ENABLE_WSL;
+        }
+        else if (!m.hasTerminal && ge.emptyBtn.has(x, y)) c.action = UI_EMPTY_INSTALL;
         return c;
     }
 
@@ -3067,7 +3231,16 @@ bool Ui::updateHover(int w, int h, int x, int y, const UiModel& m) {
             btn = 9;
         } else if (ge.content.has(x, y)) {
             if (m.page == PAGE_TERMINAL) {
-                if (!m.hasTerminal && ge.emptyBtn.has(x, y)) btn = 4;
+                if (m.fixStage == 3) {
+                    if (ge.fixReboot.has(x, y)) btn = 4;
+                }
+                else if (m.fixStage != 1 && m.fixStage != 2 &&
+                         m.wslMissing && ge.emptyBtn.has(x, y)) {
+                    btn = 4;
+                }
+                else if (!m.wslMissing && !m.hasTerminal && ge.emptyBtn.has(x, y)) {
+                    btn = 4;
+                }
             } else if (m.page == PAGE_PROJECT) {
                 if (!m.hasFolder) {
                     if (ge.emptyBtn.has(x, y)) btn = 4;

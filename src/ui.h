@@ -69,7 +69,10 @@ enum UiAction {
     UI_DISTRO_UNREGISTER,
     UI_DISTRO_INSTALL,
     UI_DISTRO_REFRESH,
-    UI_DISTRO_SCROLL
+    UI_DISTRO_SCROLL,
+    UI_ENABLE_WSL,
+    UI_COPY_WSL_CMD,
+    UI_FIX_REBOOT        // 组件装好了，让用户一键重启
 };
 
 enum InstallStage {
@@ -109,6 +112,7 @@ struct UiModel {
 
     bool         hasTerminal;
     bool         wslMissing;
+    int          wslState;
     bool         installing;
     bool         checking;
     bool         loadingOnline;
@@ -121,9 +125,24 @@ struct UiModel {
     std::vector<DistroEntry>  online;
     std::vector<DistroStatus> statuses;
 
+    // 启用 WSL 组件的进度。wsl --install 要跑UAC 提权、系统组件启用甚至重启，
+    // 全程可能好几分钟，只给一个 2.6 秒的 toast 等于什么都没说。
+    // 阶段：0 空闲 / 1 等待 UAC / 2 执行中 / 3 需要重启 / 4 失败。
+    int          fixStage;
+    unsigned long fixTick;        // 进入当前阶段的时刻，用于算已用时
+    unsigned long fixStartTick;   // 整个流程的开始时刻
+    int          fixElapsed;      // 已用秒数，由定时器刷新
+    std::wstring fixMsg;
+
     int          distroView;
     int          distroScroll;
     std::wstring distroMsg;
+
+    // WSLg（Linux 图形界面）状态。msrdc 加载 rdclientax.dll 失败时会无限弹
+    // 「无法加载远程桌面服务 ActiveX 控件」，和终端能不能用毫无关系。
+    // 探测到坏掉就自动写 .wslconfig 关掉它——代价只是不能跑 Linux GUI 程序。
+    int          wslg;
+    bool         wslgFixed;      // 这一轮刚替用户关掉了，重启 WSL 后才生效
 
     bool         hasFolder;
     std::wstring folderPath;
@@ -265,6 +284,7 @@ private:
         int menuFirst;
         int menuShown;
         Box emptyBtn;
+        Box fixBar, fixReboot;      // 启用组件的进度条 / 一键重启按钮
         std::vector<Box> treeRows;
         Box treeUp;
         Box edTool, edClose, edSave, edNew, edArea;

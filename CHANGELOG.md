@@ -1468,6 +1468,115 @@ out += struct.pack('<BBBBHHIH', sz, sz, 0, 0, pl, bpp, len(payload), i + 1)
 `LookupIconIdFromDirectoryEx`，再拿返回的 id 去 `find` 对应的 `RT_ICON`，比它的
 `biWidth` 是否等于请求值。修复前 8 个请求里 7 个对不上。
 
+## 21. Win10 上的 WSLg 弹窗 / 长行折行错位
+
+这一轮全是真机核对出来的，每一条都有对应的回归测试。
+
+### 1. 反复弹「无法加载远程桌面服务 ActiveX 控件」
+
+Win10 上 WSLg 会用 `msrdc.exe` 拉一个 RDP 会话显示 Linux 窗口，而 `rdclientax.dll`
+需要 `KERNEL32!GetTempPath2W`——系统文件版本与 Build 号不匹配时这个符号不存在，
+`msrdc` 加载失败就反复弹窗，跟终端能不能用毫无关系。
+
+判断方式不是看文件在不在（实测踩过：13 MB 完好无损，一样导不进来），
+而是 `LoadLibraryExW(rdclientax.dll, NULL, LOAD_WITH_ALTERED_SEARCH_PATH)` 试一次。
+不用 `SetDllDirectoryW`：它改的是整个进程的搜索路径，而 `wsl.cpp` 别处还要跑子进程。
+
+确认坏了就往 `%USERPROFILE%\.wslconfig` 写 `[wsl2] guiApplications=false`，
+并让 `wsl --shutdown` 生效。不需要管理员权限，代价只是不能跑 Linux GUI 程序。
+**不去动 `C:\Program Files\WSL` 下的任何文件**——`rdclientax.dll` 虽然加载失败但是
+必需文件，删了会让 WSLg 彻底起不来。
+
+写这个文件有个坑：插入点若停在段名后的换行符之前，会生成
+`[wsl2]\n\r\nguiApplications=falsememory=4GB`——键和下一条**粘成一行**，
+WSL 根本读不出这个键，配置等于没写。必须把段名后的换行一并吃掉。
+
+### 2. 窗口边框吃掉了两列
+
+窗口样式带 `WS_THICKFRAME`，`CreateWindow` 收到的尺寸是**外框**尺寸，
+客户区要小一圈——实测这个边框是每边 7 px、合计 14 px，而 `cellW` 是 8~9 px，
+**一行少 1~2 列**，最右边被裁掉，长行看起来像「不折行、末尾缺一截」。
+
+补 `AdjustWindowRectEx` 换算（注意语义：**入参是想要的客户区，返回值是要创建的外框**）。
+顺带把 `cols < 20` 那种「抬到下限」的钳制改成夹到合理范围——窗口拖窄时把列数往上抬，
+等于让终端以为有 20 列、实际只有 8 列放得下。
+
+### 3. 渲染层完全没有裁剪
+
+`TextOutW` 一次画完整串，**GDI 不认任何逻辑边界**，多出来的列直接画到窗口外。
+`paint()` 里加 `SaveDC` + `IntersectClipRect(0, 0, w, h)`，末尾 `RestoreDC`
+（`m_memDC` 是复用的，带着上一帧的裁剪区会连带影响下一帧背景填充）。
+另外用渲染时拿到的**真实**像素宽算出 `m_limitCols`，`drawRun` 按它截断；
+宽字符落在行末时后面那格不存在，不画。
+
+### 4. 编码探测把数据整批丢掉
+
+`m_enc == ENC_PROBE` 时第一批数据只用来探测编码，凑满 32 字节才回放。
+而真实 PTY 是**分小块**来的，「窗口已满但还没定论」这一档每批都会命中，
+于是每批丢一段：**120 字符只剩 60 个**，表现为长行不折行、光标压在字符上。
+
+改法是给 `m_encBuf` 当待解码队列：未定论时把剩余数据存起来，定了以后按顺序一次性冲出去。
+`flushEncoding()` 与 `feed()` 也都要先冲队列。
+
+### 5. 判据三把纯 ASCII 误判成 UTF-16
+
+`allStrictCjkPairs` 的门槛曾是 `hi >= 0x4E`。而 `"fuhwihwefw"` 里
+`f`(66) + `h`(68) 配成 U+6668「晚」——**是真汉字**，hi 也 ≥ 0x4E，
+于是整段被判 UTF-16，每个字节占两格，字符数直接砍半。
+
+这条判据本质是**欠定的**：枚举后确认可打印 ASCII 两两配对能造出 7157 个 CJK 区码点，
+占 U+4E00..U+9FFF 整段的 22.2%。所以「按码点分布区分」走不通
+（试过按半角区/全角区/高低字节分，22% 同样能造出来），唯一能救的是**样本量**：
+正常路径（攒满 32 字节 = 16 对）要求 ≥ 12 对且高字节 ≥ 0x80；
+`flushEncoding` 兜底时数据少，要求 ≥ 6 对且高字节 ≥ 0x4E，让短中文流能认出来。
+
+### 6. CSI 光标移动没有取消待折行
+
+行填满时 `emit()` 把光标钉在末列并置 `wrapPending`（延迟折行）。
+而 `processChar` 的 CSI 分支里 `A/B/C/D/E/F/G`/`` ` ``/`H`/`f`/`d`
+**全都只做 `clampCursor()`，没清 `wrapPending`**。
+
+标准终端语义（xterm/VTE）是「**任何显式光标移动都清掉待折行**」——
+待折行是「下一个字符会换行」这个延迟决定，光标被显式挪动就作废了。
+不清的话：readline 编辑长行时按一次方向键就错一格，累积到提示符被画在行中间。
+`\r` `\n` `\b` 和 `eraseInLine`/`eraseInDisplay` 本来就清了，唯独这一整类漏了。
+
+### 7. PTY 尺寸是 0×0（前六条共同的根因）
+
+guest 侧**没装 python**，`socat`/`expect`/`perl` 也没有，所以 pty bridge
+一直退到 `script -qfc '...' /dev/null` 这条兜底路径。而：
+
+```
+printf '' | script -qfc 'stty size' /dev/null    ->    0 0
+```
+
+`script` 的 pty 尺寸继承自它自己的 stdin，而 stdin 是 Windows 侧喂进来的**管道**
+→ 尺寸 0×0。`stty sane` 只重置控制标志、**不碰尺寸**。
+于是 guest 里的 bash 拿到 **0 列**，readline 的每一列计算都错。
+
+改法是显式 `stty rows N cols M` 把真实尺寸灌进去，并加 `LINES`/`COLUMNS` 环境变量兜底。
+`script` 分支还有两个固有限制（装 python 可彻底消除）：
+它会把 stdin 原样回显一遍，且不认 `\x1b]9999;CxR\x07`（窗口缩放后 guest 尺寸不更新）。
+
+**教训**：前六条各自都是真 bug、测试都能复现、修完也确实改善了，
+但没有一条去查「guest 侧到底拿到多少列」。`stty size` 返回 `0 0` 一条命令就能定位根因。
+遇到 PTY 类问题，先确认两端对尺寸/编码/协议的认知是否一致，再动手改渲染层。
+
+### 本轮新增测试
+
+| 文件 | 项数 | 锁住的东西 |
+|---|---|---|
+| `tools/test_wslg.cpp` | 18 | `.wslconfig` 写入：建段 / 幂等 / 保留原键 / 键独占一行（回归粘行）/ 删除后字节级不动其他内容 |
+| `tools/test_cols_fit.cpp` | 8 | `AdjustWindowRectEx` 换算的精确 round-trip；边框 14 px ≥ 一个 cellW，旧代码每行确定少 1~2 列 |
+| `tools/test_clip.cpp` | 4 | `m_limitCols` 取值与对 `drawRun` 的约束（含 cols 超画布 4 倍的极端例） |
+| `tools/test_wrap.cpp` | 6 | 分 7 字节喂 120 字符的数据守恒 / 折行位置 / 窄网格 / 宽字符不覆盖前格 / 回归 ASCII 配对撞真汉字 |
+| `tools/test_readline.cpp` | 12 | **真实抓到的 guest 字节流**驱动 Terminal：裸 BEL 不写字符、OSC 的 BEL/ST 两种终止、连发 20 个 OSC 后状态机不坏 |
+| `tools/test_cursor_move.cpp` | 9 | 「CSI 光标移动必须取消待折行」不变量，覆盖 D/C/G/BS 四条路径 |
+
+顺带一条方法论：`CreateCompatibleBitmap` 自身有边界，超宽的像素根本写不进去，
+所以「渲染到位图再逐像素查右缘」这种测法**恒过**，抓不到裁剪 bug——
+第一版 `test_clip.cpp` 故意把 clip 全删掉也照样 PASS。改用哨兵色 + 逻辑断言才测得出来。
+
 ## 验证状态
 
 | 检查项 | 结果 |
@@ -1490,6 +1599,9 @@ out += struct.pack('<BBBBHHIH', sz, sz, 0, 0, pl, bpp, len(payload), i + 1)
 | 终端内 shell 交互 | **通过** —— 真机实测：兼容通道拿到提示符 `root@DESKTOP-J5SKJQM wsl-embed#`，合成按键输入 `uname` / `qwert` 后回显与按键一一对应，`bash: … command not found` 正常回显（`docs/ui-terminal.png`） |
 | 去掉引号后的发行版启动 | **通过** —— `wsl -d archlinux` 起得来，能交互；带引号版本在同一台机器上稳定复现 `Wsl/Service/WSL_E_DISTRO_NOT_FOUND` |
 | 失效标记自愈 | **通过** —— 真实 `settings.ini` 里原本是 `broken=archlinux`，启动一次后变成 `broken=`，随后正常进入 archlinux 终端 |
+| WSLg 弹窗自动关闭 | **通过** —— 真机实测 `msrdc.exe` 不再被拉起、RDP 弹窗计数 0、`TERM=xterm-256color` 与内核 `6.18.40.1-microsoft-standard-WSL2` 正常、`WAYLAND_DISPLAY`/`DISPLAY` 为空（正是 WSLg 已关的标志）；删掉 `.wslconfig` 重启 `EWSL.exe` 后 6 秒内自己写回配置 |
+| 长行折行与右缘裁切 | **通过** —— 真实 PTY 输入 360 字符，长行整齐折成多行，右缘留 51 px（约 5.7 个字符格）余量；`test_wrap` / `test_cols_fit` / `test_clip` 覆盖数据守恒、边框换算、裁剪三个层面 |
+| PTY 尺寸一致性 | **通过** —— `stty size` 从 `0 0` 变为真实 `40 120`；guest 回发的原始字节流已用临时钩子抓取并解析，readline 序列（`CSI ?2004h` / `OSC 0;` / `OSC 3008;` / `CR`+`LF`）全部按标准语义消化 |
 | `wsl --import` 真实注册 | **通过（用户机上）** —— `%LOCALAPPDATA%\WslEmbed\distros\archlinux\` 下 `ext4.vhdx` 681 MB、`image.wsl` 117 MB；注册表 `Lxss` 项 `DistributionName=archlinux`、`Version=2`、`State=1`；`wsl -d archlinux -e /bin/echo WSL_OK` 返回 `WSL_OK` |
 | 根文件系统体检 | **通过** —— `distroRootfsState()` 读 `Lxss\<GUID>` 的 `BasePath` 并检查 `ext4.vhdx`，与 PowerShell 手工核对结果一致（`VHDX-OK`） |
 | ConPTY 子进程接管 | **实测不成立** —— `hostname.exe` / `wsl -e echo` 的输出都不进 ConPTY，只收到 16 字节握手；参数与结构尺寸逐项核对无误，四种 `CreateProcess` 组合、脱控制台、非沙箱均相同。已据此改成「ConPTY 优先 + 3 秒降级 + 记住结果」 |

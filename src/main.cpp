@@ -14,6 +14,7 @@
 
 #include <windows.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 
 #include <cstring>
 #include <string>
@@ -55,6 +56,7 @@ typedef void    (WINAPI *PFN_ClosePseudoConsole)(HPCON_T);
 #define WM_APP_DL_DONE  (WM_APP + 6)
 #define WM_APP_VERIFY   (WM_APP + 7)
 #define WM_APP_DISTRO   (WM_APP + 8)
+#define WM_APP_WSLFIX   (WM_APP + 9)
 
 #define TIMER_REPAINT 1
 #define TIMER_CARET   2
@@ -78,8 +80,15 @@ struct ProbeResult {
     std::vector<std::wstring> dead;
     std::wstring def;
     std::wstring version;
+    int  state;
 
-    ProbeResult() : wslOk(false) {}
+    // WSLg（Linux 图形界面）状态。msrdc 装不上 rdclientax.dll 时会无限弹
+    // 「无法加载远程桌面服务 ActiveX 控件」，跟能不能用终端毫无关系。
+    // wslgFixed 表示这一轮已经替用户把 guiApplications=false 写进 .wslconfig。
+    int  wslg;
+    bool wslgFixed;
+
+    ProbeResult() : wslOk(false), state(WSL_UNKNOWN), wslg(WSLG_NO_DLL), wslgFixed(false) {}
 };
 
 struct App {
@@ -164,6 +173,10 @@ struct App {
     int  escState;
     int  ptyText;
     DWORD animTick;
+    bool wslFixBusy;
+    std::wstring wslFixOut;
+    volatile LONG wslFixApproved;    // -1 失败 / 0 未知 / 1 已提权成功
+    volatile LONG wslFixElapsedMs;   // 后台线程累计的等待毫秒
 
     App()
         : hwnd(NULL), term(NULL), rend(NULL), ui(NULL), ed(NULL), hpc(NULL),
@@ -186,7 +199,8 @@ struct App {
           suppressLaunch(false), autoFallbackTried(false),
           autoTarget(false), quietExit(false), verifying(false),
           verifyWasAuto(false), ptyBridge(false), conptyOk(-1), escState(0),
-          ptyText(0), animTick(0) {}
+          ptyText(0), animTick(0), wslFixBusy(false),
+          wslFixApproved(0), wslFixElapsedMs(0) {}
 };
 
 static App* g_app = NULL;
@@ -657,11 +671,90 @@ static void jobLogStream(App* app, const std::string& raw) {
     if (carry.size() > 4096) carry.clear();
 }
 
+struct WslFixArg {
+    App* app;
+    WslFixArg() : app(NULL) {}
+};
+
+//启用组件要管理员，wsl --install 自己不带提权。非提权跑一遍只会拿到
+// 「此操作需要提升的权限」，所以直接用 runas verb 拉起，由 UAC 弹窗授权。
+// 提权被拒时 ShellExecuteEx 返回 ERROR_CANCELLED，这里如实回报，不假装成功。
+static DWORD WINAPI WslFixThread(LPVOID param) {
+    WslFixArg* a = (WslFixArg*)param;
+    App* app = a->app;
+
+    std::wstring exe = findWslExe();
+    std::wstring verb = L"runas";
+    std::wstring file = exe.empty() ? std::wstring(L"wsl.exe") : exe;
+    std::wstring args = L"--install --no-distribution";
+
+    SHELLEXECUTEINFOW sei;
+    memset(&sei, 0, sizeof(sei));
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NO_CONSOLE;
+    sei.lpVerb = verb.c_str();
+    sei.lpFile = file.c_str();
+    sei.lpParameters = args.c_str();
+    sei.lpDirectory = NULL;
+    sei.nShow = SW_HIDE;
+
+    std::wstring out;
+    BOOL ok = ShellExecuteExW(&sei);
+
+    WCHAR num[64];
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        wsprintfW(num, L"%lu", err);
+        if (err == ERROR_CANCELLED)
+            out = LS(L"已取消授权，没有做任何更改");
+        else
+            out = LS(L"无法提权启动 wsl --install（错误码 ") + std::wstring(num) + LS(L"）");
+        app->wslFixApproved = -1;          // 失败，别停在「等待授权」
+    } else {
+        app->wslFixApproved = 1;
+        if (sei.hProcess) {
+            // 分段等待，好让 UI 线程有机会推进阶段与超时提示。
+            // wsl --install 启用系统组件可能要好几分钟，超时给个明确说法，
+            // 而不是让进度条一直停在 95% 让人猜。
+            const DWORD kWait = 15 * 60 * 1000;
+            DWORD waited = 0;
+            bool timedOut = false;
+            for (;;) {
+                DWORD r = WaitForSingleObject(sei.hProcess, 1000);
+                if (r != WAIT_TIMEOUT) break;
+                waited += 1000;
+                if (waited >= kWait) { timedOut = true; break; }
+                app->wslFixElapsedMs = waited;
+            }
+            app->wslFixElapsedMs = waited;
+
+            DWORD code = 0;
+            if (timedOut) {
+                out = LS(L"命令仍在后台运行，请稍候或重启后重新检测");
+            } else if (GetExitCodeProcess(sei.hProcess, &code) && code != 0) {
+                wsprintfW(num, L"%lu", code);
+                out = LS(L"wsl --install 返回 ") + std::wstring(num);
+            }
+            CloseHandle(sei.hProcess);
+        }
+        if (out.empty()) out = LS(L"命令已执行完成");
+    }
+
+    app->wslFixOut = out;
+    app->wslFixElapsedMs = 0;
+    PostMessageW(app->hwnd, WM_APP_WSLFIX, 0, 0);
+    return 0;
+}
+
 static DWORD WINAPI ProbeThread(LPVOID param) {
     App* app = (App*)param;
 
     ProbeResult* r = new ProbeResult();
-    r->wslOk = wslAvailable();
+    r->state = wslState();
+    // inbox wsl.exe 在组件被禁用时照样存在，findWslExe() 非空不代表 WSL 能跑。
+    // 只有探到 READY 才去列发行版，否则会把 inbox 版的帮助文本当成发行版列表。
+    r->wslOk = (r->state == WSL_READY);
     if (r->wslOk) {
         r->installed = listInstalledDistros();
 
@@ -711,6 +804,22 @@ static DWORD WINAPI ProbeThread(LPVOID param) {
                 r->version = t;
                 break;
             }
+        }
+    }
+
+    // WSLg 坏了就顺手关掉。这个检测只花一次 LoadLibrary 的时间，
+    // 而收益是用户不再被无限弹窗骚扰，所以放在启动探测里无条件做。
+    //
+    // 前提是 WSL 本身能用：组件都没启用的话 msrdc 根本不会被拉起来，
+    // 没什么可关的，交给「启用 WSL 组件」那条路去处理。
+    if (r->wslOk) {
+        r->wslg = wslgState();
+        if (r->wslg == WSLG_BROKEN && disableWslg()) {
+            // 写 .wslconfig 不需要管理员权限，但 wsl --shutdown 会关掉所有
+            // 正在跑的发行版。EWSL 自己正要开的那个终端也会一起没，
+            // 所以这里只标记，让 UI 告诉用户「下次生效」而不是直接关。
+            r->wslgFixed = true;
+            r->wslg = WSLG_OFF;
         }
     }
 
@@ -972,6 +1081,8 @@ static void refreshUi(App* app) {
     if (app->hwnd) InvalidateRect(app->hwnd, NULL, FALSE);
 }
 
+static void notifyPtySize(App* app);
+
 static void refitTerminal(App* app) {
     RECT rc;
     GetClientRect(app->hwnd, &rc);
@@ -979,8 +1090,9 @@ static void refitTerminal(App* app) {
     app->ui->contentRect(rc.right, rc.bottom, l, t, r, b, app->model.page);
     int cols = (r - l) / app->rend->cellW();
     int rows = (b - t) / app->rend->cellH();
-    if (cols < 20) cols = 20;
-    if (rows < 4) rows = 4;
+    // 同syncTermSize：列数上限于实际可绘制宽度，不能靠抬到 20 来"补齐"
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
 
     if (app->term) app->term->resize(cols, rows);
     if (app->hpc && app->fnResize) {
@@ -989,6 +1101,9 @@ static void refitTerminal(App* app) {
         sz.Y = (SHORT)rows;
         app->fnResize(app->hpc, sz);
     }
+    // 改字号/ 开编辑器都会走到这里，列数变了 guest 必须知道，
+    // 否则它按旧列数折行、我们按新列数画，又会错位。
+    notifyPtySize(app);
 
     {
         static DWORD lastSave = 0;
@@ -1118,8 +1233,11 @@ static std::string ptyBridgeSource(int cols, int rows) {
     p += "H=" + numStr(rows) + "\n";
     p += "M=b'\\x1b]9999;'\n";
     p += "def rz(f):\n";
+    // ioctl 失败不要静默吞掉：尺寸设不上，guest 就一直按默认 80 列折行，
+    // 我们按真实列数画，两边错位之后提示符会插在行中间。
+    // 往 stderr 写一行，宿主侧能从管道日志里看到。
     p += " try: fcntl.ioctl(f,termios.TIOCSWINSZ,struct.pack('HHHH',H,W,0,0))\n";
-    p += " except Exception: pass\n";
+    p += " except Exception as e: os.write(2,('winsz %dx%d: %s\\n'%(H,W,e)).encode())\n";
     p += "pid,fd=pty.fork()\n";
     p += "if pid==0:\n";
     p += " os.environ['TERM']='xterm-256color'\n";
@@ -1184,24 +1302,61 @@ static std::wstring interactiveArgs(App* app, const std::wstring& distro) {
     if (app && app->term) {
         cols = app->term->cols();
         rows = app->term->rows();
-        if (cols < 20) cols = 20;
-        if (rows < 4) rows = 4;
+        // 不要在这里「抬到下限」。bridge 拿这个值去开 guest 的 pty，
+        // 抬过之后 guest 以为的列数就比我们能画的多，它在多出来的列上折行、
+        // 我们在真实边界上折，两边错位，提示符会插在行中间。
+        // 宁可给个偏小的值——syncTermSize 随后会再通知一次真正的尺寸。
+        if (cols < 1) cols = 1;
+        if (rows < 1) rows = 1;
     }
     g_ptyBridgeB64 = b64Encode(ptyBridgeSource(cols, rows));
 
     std::wstring a;
     if (!distro.empty()) a = L"-d " + distroArg(distro);
 
-    // Kept free of double quotes so the Windows command line stays one flat
-    // quoted argument.
+    // 两条路径。
+    //
+    // 有 python：走 bridge 脚本，它自己管 pty、能解析 \x1b]9999;CxR\x07
+    // 动态改尺寸，交互最干净。
+    //
+    // 没 python（本机 archlinux 就是这样，`pacman -Q python` 查无此包）：
+    // 退到 script。**script 有个必须处理的坑**——它的 pty 尺寸继承自自己的 stdin，
+    // 而 stdin 是我们从 Windows 喂进去的管道，实测尺寸是 **0 0**：
+    //     printf '' | script -qfc 'stty size' /dev/null   ->   0 0
+    // `stty sane` 只重置控制标志、不碰尺寸，所以 bash 拿到的是 0 列，
+    // readline 的每一列计算都错——症状就是提示符位置乱、长行折行错位、
+    // 新旧内容交错（这几轮反复出现的现象，根因就在这里）。
+    // 所以必须显式 stty rows/cols 把真实尺寸灌进去。
+    //
+    // 已知残留问题（script 分支的固有限制，装 python 可彻底消除）：
+    //   - script 会把 stdin 原样回显一遍（管道输入时尤其明显）
+    //   - 不认 \x1b]9999;CxR\x07，窗口缩放后 guest 尺寸不更新
+    // 这两条都比「列数为 0」轻得多。
+    WCHAR rowsW[32], colsW[32];
+    _snwprintf(rowsW, 32, L"%d", rows);
+    _snwprintf(colsW, 32, L"%d", cols);
+    std::wstring sttyCmd = L"stty rows ";
+    sttyCmd += rowsW;
+    sttyCmd += L" cols ";
+    sttyCmd += colsW;
+    sttyCmd += L" 2>/dev/null; stty sane 2>/dev/null; exec /bin/bash -l -i";
+
+    // LINES/COLUMNS 是 bash/readline 的环境兜底：万一 stty 那步失败
+    // （某些 script 实现会吞掉 stty），readline 至少还能从这里拿到列数。
     std::wstring sh =
-        L"if P=$(command -v python3 || command -v python); then exec $P -c "
-        L"'import sys,base64;exec(base64.b64decode(sys.argv[1]).decode())' '";
+        L"export LINES=";
+    sh += rowsW;
+    sh += L" COLUMNS=";
+    sh += colsW;
+    sh += L"; ";
+    sh += L"if P=$(command -v python3 || command -v python); then exec $P -c "
+          L"'import sys,base64;exec(base64.b64decode(sys.argv[1]).decode())' '";
     sh += asciiToWide(g_ptyBridgeB64);
     sh += L"'; fi; "
           L"if command -v script >/dev/null 2>&1; then exec env "
-          L"TERM=xterm-256color script -qfc "
-          L"'stty sane 2>/dev/null; exec /bin/bash -l -i' /dev/null; fi; "
+          L"TERM=xterm-256color script -qfc '";
+    sh += sttyCmd;
+    sh += L"' /dev/null; fi; "
           L"exec env TERM=xterm-256color /bin/bash -l -i";
 
     a += L" -e sh -c \"";
@@ -1211,9 +1366,14 @@ static std::wstring interactiveArgs(App* app, const std::wstring& distro) {
 }
 
 static void notifyPtySize(App* app) {
-    if (!app || !app->ptyBridge || !app->term) return;
+    if (!app || !app->term) return;
     if (app->transport != TRANSPORT_PIPE) return;
     if (!app->hPipeWrite) return;
+    // ptyBridge 这个门槛必须留着：bridge 脚本还没跑到读 stdin 那一段时，
+    // OSC 会被当成普通输入喂给 guest，readline 直接把 ^[[9999;193x56^G
+    // 显示在命令行上（试过去掉，泄漏得很明显）。
+    // 尺寸同步改由「bridge 回执之后补发一次」保证，见 detectPtyBridge。
+    if (!app->ptyBridge) return;
 
     std::string msg = "\x1b]9999;";
     msg += numStr(app->term->cols());
@@ -1987,8 +2147,14 @@ static void syncTermSize(App* app, int clientW, int clientH, bool notify) {
     int cols = (r - l) / cw;
     int rows = (b - t) / ch;
 
-    if (cols < 20) cols = 20;
-    if (rows < 4) rows = 4;
+    // 窗口被拖得比最小宽度还窄时，(r-l)/cw 会掉到 20 以下。以前这里是把 cols
+    // 抬回 20，于是终端以为有 20 列、实际只有 8 列放得下，右边那几列直接画到
+    // 窗口外被裁掉——长行看起来「不折行、末尾缺一截」。现在反其道而行：
+    // 宁可少列，让内容折行，也不要超出可绘制范围。
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+    if (cols > 4000) cols = 4000;
+    if (rows > 2000) rows = 2000;
 
     if (cols == app->term->cols() && rows == app->term->rows()) return;
 
@@ -2299,6 +2465,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (dt > 80) dt = 80;
             app->animTick = now;
 
+            // 启用组件的进度：秒表一直走，扫光才动得起来。
+            // 后台线程给的毫秒数比 UI 帧数精确得多，用它算秒数，
+            // 这样即使定时器被别处SetTimer 冲掉也不会走慢。
+            if (app->model.fixStage == 1 || app->model.fixStage == 2) {
+                DWORD bg = (DWORD)InterlockedCompareExchange(&app->wslFixElapsedMs, 0, 0);
+                DWORD base = app->model.fixStartTick;
+                DWORD byTick = (now >= base) ? (now - base) : 0;
+                DWORD el = (bg > byTick) ? bg : byTick;
+                app->model.fixElapsed = (int)(el / 1000);
+
+                // 提权成功就切到「执行中」。UAC 弹窗还开着的时候 approved 还是 0，
+                // 这段时间显示「等待授权」并让用户知道要去点那个窗口。
+                LONG ap = InterlockedCompareExchange(&app->wslFixApproved, 0, 0);
+                if (app->model.fixStage == 1 && ap == 1) {
+                    app->model.fixStage = 2;
+                    app->model.fixTick = now;
+                    app->model.fixMsg = LS(L"正在启用系统组件，可能需要几分钟");
+                }
+            }
+
             app->ui->tickAnim((int)dt, app->model);
 
             bool toastAlive = false;
@@ -2316,7 +2502,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                               app->instStage == INST_VERIFY));
             bool shimmer = (app->instStage == INST_DOWNLOAD);
 
-            if (!app->ui->animActive() && !toastAlive && !spinning && !shimmer) {
+            // 启用流程没结束就得继续重绘：扫光、百分比、秒表都在动。
+            bool fixing = (app->model.fixStage == 1 || app->model.fixStage == 2);
+
+            if (!app->ui->animActive() && !toastAlive && !spinning && !shimmer && !fixing) {
                 KillTimer(hwnd, TIMER_ANIM);
             }
             InvalidateRect(hwnd, NULL, FALSE);
@@ -2714,14 +2903,79 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_APP_WSLFIX: {
+        if (!app) return 0;
+        app->wslFixBusy = false;
+
+        // 组件状态缓存在 wsl.cpp 里，不清掉的话重新探测还是拿到旧结论。
+        resetWslState();
+        dropWslPathCache();
+
+        std::wstring msg = app->wslFixOut;
+        app->wslFixOut.clear();
+
+        bool approved = (InterlockedCompareExchange(&app->wslFixApproved, 0, 0) == 1);
+
+        if (!approved) {
+            app->model.fixStage = 4;
+            app->model.fixMsg = msg.empty() ? LS(L"操作未完成") : msg;
+            refreshUi(app);
+            return 0;
+        }
+
+        // 探一次，看组件到底生效没有。wsl --install 启用系统组件后通常要重启，
+        // 这时候探测依然会报未启用——这不是失败，得如实说成「需要重启」。
+        WslState st = wslState();
+
+        if (st == WSL_READY) {
+            app->model.fixStage = 0;
+            app->model.fixMsg.clear();
+            showToast(app, LS(L"WSL 组件已启用"));
+            CreateThread(NULL, 0, ProbeThread, app, 0, NULL);
+            return 0;
+        }
+
+        // 没生效：十有八九是等着重启。wsl --install 自己也会在输出里提示重启，
+        // 而它重启了本进程就没机会把这句话说出来，所以由界面来说。
+        app->model.fixStage = 3;
+        app->model.fixMsg = LS(L"组件已安装，重启后即可使用");
+        if (!msg.empty() && msg != LS(L"命令已执行完成")) {
+            app->model.fixMsg = msg + LS(L"（可能需要重启）");
+        }
+        refreshUi(app);
+        return 0;
+    }
+
     case WM_APP_PROBE: {
         ProbeResult* r = (ProbeResult*)lParam;
         if (!app || !r) return 0;
 
         app->model.checking = false;
         app->model.wslMissing = !r->wslOk;
+        app->model.wslState = r->state;
         app->model.installed = r->installed;
         app->model.wslVersion = r->version;
+        app->model.wslg = r->wslg;
+        app->model.wslgFixed = r->wslgFixed;
+
+        // 探到可用就说明组件真的生效了，把「等重启」那条提示收掉。
+        if (r->wslOk && app->model.fixStage == 3) {
+            app->model.fixStage = 0;
+            app->model.fixMsg.clear();
+        }
+
+        if (!r->wslOk) {
+            dropWslPathCache();
+            refreshUi(app);
+            delete r;
+            return 0;
+        }
+
+        // WSLg 坏掉时探测线程已经替用户写好了 .wslconfig。得说一声，
+        // 否则「重启 WSL 后 Linux 图形程序会打不开」这种后果就是无预告的。
+        if (r->wslgFixed) {
+            showToast(app, LS(L"已自动关闭 WSL 图形界面（rdclientax.dll 加载失败会导致反复弹窗），重启 WSL 后生效"));
+        }
 
         if (!r->dead.empty()) {
             bool changed = false;
@@ -2801,6 +3055,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 app->model.instErr.clear();
                 app->model.instHint.clear();
                 app->model.instPercent = 100;
+
+                // 装完发行版正是 WSLg 会被拉起来的那一刻，顺手查一下。
+                // 新装的发行版第一次启动就会弹满屏 RDP 报错，比安装前更烦人。
+                if (wslgState() == WSLG_BROKEN && disableWslg()) {
+                    app->model.wslg = WSLG_OFF;
+                    app->model.wslgFixed = true;
+                    app->model.instHint = LS(L"检测到 WSL 图形界面组件加载失败，会反复弹远程桌面提示，已自动关闭。重启 WSL 后生效。");
+                }
             } else {
                 app->model.instErr = LS(L"安装已完成但 WSL 未注册该发行版");
                 app->model.instHint = LS(L"可能是 WSL 需要重启：在 PowerShell 执行 wsl --shutdown 后重试。");
@@ -3137,13 +3399,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         // Enter. With a real terminal in front of the guest (ConPTY, or the
         // guest-side pty bridge) the line discipline maps CR to NL for us.
-        // A bare pipe has no line discipline at all, so only NL ends a line
-        // there - and a prompt like dnf's "Is this ok [y/N]:" waits on exactly
-        // that byte, which is what looked like a frozen terminal.
+        //
+        // 早先这里在 PIPE 模式下还挑 `!app->ptyBridge ? "\n" : "\r"`，理由是
+        // 「裸管道没有行规程、只认 NL」。可 PIPE 模式一定注入了 bridge 脚本，
+        // 那边 pty.fork() 出来的 guest 前面是有真 pty 的，CR 会被正确转成 NL；
+        // 而 ptyBridge 要等 \x1b]9998;wemb-pty 回执才置 true，启动初期一直是
+        // false，于是刚开始那几秒按回车发的是裸 \n —— readline 收到的东西
+        // 和预期不一样，提示符就画到了行中间（症状：zabc[root@...]# ）。
+        // 「还没确认 bridge 活着」不能当「没有 bridge」用。
         if (wc == L'\r' || wc == L'\n') {
-            const char* term =
-                (app->transport == TRANSPORT_PIPE && !app->ptyBridge) ? "\n" : "\r";
-            writePty(app, term, 1);
+            writePty(app, "\r", 1);
             return 0;
         }
 
@@ -3366,6 +3631,52 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 app->page = PAGE_PROJECT;
                 rebuildTree(app);
                 refreshUi(app);
+            }
+            return 0;
+        }
+
+        case UI_ENABLE_WSL: {
+            if (app->wslFixBusy) {
+                showToast(app, LS(L"正在处理，请稍候"));
+                return 0;
+            }
+            if (app->model.wslState == WSL_NO_EXE) {
+                showToast(app, LS(L"未找到 wsl.exe，无法自动启用"));
+                return 0;
+            }
+
+            app->wslFixBusy = true;
+            InterlockedExchange(&app->wslFixApproved, 0);
+            InterlockedExchange(&app->wslFixElapsedMs, 0);
+
+            app->model.fixStage = 1;              // 等待 UAC 授权
+            app->model.fixStartTick = GetTickCount();
+            app->model.fixTick = app->model.fixStartTick;
+            app->model.fixElapsed = 0;
+            app->model.fixMsg = LS(L"请在弹出的 UAC 窗口点「是」");
+
+            WslFixArg* a = new WslFixArg();
+            a->app = app;
+            CreateThread(NULL, 0, WslFixThread, a, 0, NULL);
+
+            // 进度条有扫光和秒表，动画定时器得一直转
+            SetTimer(app->hwnd, TIMER_ANIM, 16, NULL);
+            refreshUi(app);
+            return 0;
+        }
+
+        case UI_FIX_REBOOT: {
+            // 组件装完必须重启才生效。直接把原因摆出来，别让用户以为装失败了。
+            // LS() 返回的是 const wchar_t*，相加前要先包成 std::wstring。
+            std::wstring q = std::wstring(LS(L"WSL 组件已安装，需要重启 Windows 才能生效。\n\n"))
+                           + LS(L"现在重启会关闭所有打开的程序，确定吗？");
+            int ans = MessageBoxW(app->hwnd, q.c_str(), LS(L"需要重启"),
+                                  MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+            if (ans == IDYES) {
+                // 没有 SeShutdownPrivilege 时会失败，至少把提示给出来
+                if (!ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0)) {
+                    showToast(app, LS(L"系统拒绝了重启请求，请手动重启"));
+                }
             }
             return 0;
         }
@@ -3851,10 +4162,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    int winW = cols * cellW + sideW;
-    int winH = rows * cellH + app.ui->titleH();
-    if (winW < 880) winW = 880;
-    if (winH < 560) winH = 560;
+    // 客户区先给个下限，保证侧栏 + 至少一屏内容放得下。
+    int clientW = cols * cellW + sideW;
+    int clientH = rows * cellH + app.ui->titleH();
+    if (clientW < 880) clientW = 880;
+    if (clientH < 560) clientH = 560;
+    int winW = clientW;
+    int winH = clientH;
 
     // Centre inside the work area, not the whole screen. SM_CYSCREEN still counts
     // the strip the taskbar sits on, so centring on it can tuck the custom title
@@ -3884,6 +4198,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (y < wa.top) y = wa.top;
 
     DWORD style = WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
+
+    // 客户区尺寸 -> 外框尺寸。少了这一步，CreateWindow 收到的 winW/winH 是按
+    // 客户区算的，但 WS_THICKFRAME 会在四周补上非客户区边框，于是真实客户区
+    // 比 cols*cellW 窄了大约一个单元格（通常 7-8px，DWM 隐形扩展边框也在内），
+    // 最右边那列画出去被裁掉——症状是长行不折行、末尾字符缺一块。
+    RECT cr = { 0, 0, clientW, clientH };
+    if (!AdjustWindowRectEx(&cr, style, FALSE, 0)) {
+        cr.right = clientW;
+        cr.bottom = clientH;
+    }
+    winW = cr.right - cr.left;
+    winH = cr.bottom - cr.top;
 
     HWND hwnd = CreateWindowExW(0, kClassName, L"EWSL", style,
                                 x, y, winW, winH,

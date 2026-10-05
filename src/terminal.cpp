@@ -146,8 +146,13 @@ Terminal::Terminal(int cols, int rows)
       m_oscEsc(false),
       m_utf8Acc(0),
       m_utf8Need(0),
+      m_enc(ENC_PROBE),
+      m_probeLen(0),
+      m_encHighByte(false),
+      m_encHi(0),
       m_rev(0) {
     m_lines = makeBlankScreen();
+    memset(m_probe, 0, sizeof(m_probe));
 }
 
 std::vector<Cell> Terminal::makeBlankLine() const {
@@ -237,6 +242,14 @@ void Terminal::hardReset() {
     m_osc.clear();
     m_utf8Acc = 0;
     m_utf8Need = 0;
+    // 换发行版要重新探编码：上一段是 inbox wsl.exe 的 UTF-16 帮助文本，这一段
+    // 是 guest 的 UTF-8 shell，锁死在旧编码上会把新会话的输出全部吃掉。
+    m_enc = ENC_PROBE;
+    m_probeLen = 0;
+    m_encBuf.clear();
+    m_encHighByte = false;
+    m_encHi = 0;
+    memset(m_probe, 0, sizeof(m_probe));
 }
 
 // Every cell carries a colour snapshot, so a theme switch has to walk the whole
@@ -380,7 +393,272 @@ const std::vector<Cell>& Terminal::visibleLine(int index, int scrollOffset) cons
     return m_lines[(size_t)index];
 }
 
-void Terminal::feed(const char* data, size_t len) {
+// UTF-8 结构扫描。
+//
+// 判据不能只看「奇数位有没有 0x00」：inbox wsl.exe 输出的中文里
+// 「安装」= 89 5B C5 88，奇数位一个 0 都没有，只看零字节会把纯中文的
+// UTF-16 误判成 UTF-8，这正是原来乱码的成因。必须做结构判定——
+// UTF-8 多字节序列后面跟的字节都在 0x80..0xBF，UTF-16 的 CJK 区
+// （U+4E00..U+9FFF 在 LE 下是 xx 4E..9F）必然违反这一点。
+//
+// seqs 回填完整多字节序列的个数：字节流合法且至少含一个多字节序列时，
+// 基本可以断定是 UTF-8（纯 ASCII 两种编码都能解释，不算证据）。
+// 尾部被截断的多字节序列不算错，留给后续字节补齐。
+static int scanUtf8(const unsigned char* b, int n, int* seqs) {
+    int i = 0;
+    *seqs = 0;
+
+    while (i < n) {
+        unsigned char c = b[i];
+        int need;
+        unsigned char lo, hi;
+
+        if (c < 0x80)                      { ++i; continue; }
+        else if (c >= 0xC2 && c <= 0xDF)   { need = 1; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xE0)                { need = 2; lo = 0xA0; hi = 0xBF; }
+        else if (c >= 0xE1 && c <= 0xEC)   { need = 2; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xED)                { need = 2; lo = 0x80; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF)   { need = 2; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xF0)                { need = 3; lo = 0x90; hi = 0xBF; }
+        else if (c >= 0xF1 && c <= 0xF3)   { need = 3; lo = 0x80; hi = 0xBF; }
+        else if (c == 0xF4)                { need = 3; lo = 0x80; hi = 0x8F; }
+        else return 1;                             // 0x80..0xC1 / 0xF5..0xFF 非法
+
+        if (i + need >= n) break;                    // 窗口不够，判不了
+        for (int k = 1; k <= need; ++k) {
+            unsigned char t = b[i + k];
+            if (t < lo || t > hi) return 1;
+        }
+        ++*seqs;
+        i += need + 1;
+    }
+    return 0;
+}
+
+// 「像 UTF-8」和「像 UTF-16」并不互斥：CJK 的 UTF-16 字节 60 4F 7D 59 里
+// 0x60 / 0x4F / 0x7D / 0x59 全都 < 0x80，逐字节看完全合法。所以要额外看
+// 码元本身：按 UTF-16LE 拼出来若是**每一对**都是 CJK / 全角，那才是 UTF-16。
+//
+// 必须是「每一对」而不是「过半」：纯 ASCII 两两配对落进 CJK 区（U+4E00 起）
+// 的概率约三成，「过半」会把 "ASCIIONLYTEXT" 这类文本误判成 UTF-16——
+// 'A''S' = 41 53 拼出 0x5341，正好是一个真实汉字。宁可漏判也不能误判：
+// 漏判由 flushEncoding 兜底，误判的代价是正文被吃掉字符。
+//
+// hi >= 0x4E 这条再挡一层：ASCII 拼出的假码元高字节是 0x30..0x7A 的字母、
+// 数字、标点，而真 CJK 落在 U+4E00..U+9FFF 必然 >= 0x4E。minPairs 在探测
+// minPairs 是样本量门槛（下面explain 里那套统计）。
+//
+// 关于短流（tiny）：ASCII 与 UTF-16 中文在短样本上**信息论上不可区分**——
+// 4 字节纯 ASCII 配出来也可能正好是两个汉字码位。实测这题没有确定解：
+//   "ABCD" -> U+4243「äsomething」全CJK，误判成 UTF-16
+//   "你好" -> 60 4F 7D 59，hi 只有 0x4F/0x59，又不满足严格档
+// 唯一可用的方向是**要求更多样本**：ASCII 凑出 N 对全是汉字的概率随 N 指数
+// 衰减，而 wsl.exe 的中文报错通常一整句（10+ 字 = 20+ 字节）。
+// 所以兜底路径要求 >= 6 对（12 字节）；更短的按 UTF-8 处理——
+// 那种情况下更可能是 guest shell 的 ASCII 提示符。
+static bool allStrictCjkPairs(const unsigned char* b, int n, int minPairs, bool tiny) {
+    int pairs = n / 2;
+    if (pairs < minPairs) return false;
+
+    for (int i = 0; i + 1 < n; i += 2) {
+        unsigned hi = b[i + 1];
+        uint32_t cp = (uint32_t)b[i] | ((uint32_t)hi << 8);   // LE
+
+        bool cjk = (cp >= 0x4E00 && cp <= 0x9FFF) ||     // 统一表意
+                   (cp >= 0x3400 && cp <= 0x4DBF) ||     // 扩展 A
+                   (cp >= 0x3000 && cp <= 0x303F) ||     // CJK 标点
+                   (cp >= 0xF900 && cp <= 0xFAFF) ||     // 兼容表意
+                   (cp >= 0xFF01 && cp <= 0xFF60);      // 全角
+
+        if (!cjk) return false;
+        // 正常路径（攒满一窗）要严格：hi >= 0x80，纯 ASCII 配对的高字节恒 <= 0x7E。
+        // 兜底路径样本少、只靠「每对都是 CJK」这一条，把 hi 门槛降到 0x4E
+        // 让「你好」这种短中文流能认出来。
+        if (tiny) { if (hi < 0x4E) return false; }
+        else      { if (hi < 0x80) return false; }
+    }
+    return true;
+}
+
+// 探测窗口。4 字节太短——ASCII 两两配对就能撞出汉字，三条判据必然打架；
+// 32 字节足以让它们分出胜负，又不至于让首屏等太久。
+static const int kProbeWindow = 32;
+
+// 与 Terminal::Encoding 取值一致。判定逻辑写在类外的自由函数里，
+// 拿不到私有枚举，这里定义一份同值的文件作用域常量。
+enum {
+    ENC_PROBE   = 0,
+    ENC_UTF8    = 1,
+    ENC_UTF16LE = 2,
+    ENC_UTF16BE = 3
+};
+
+struct EncVerdict {
+    int  enc;        // ENC_UTF8 / ENC_UTF16LE / ENC_UTF16BE
+    int  skip;       // 需要丢掉的流首字节数（只有 BOM）
+    bool decided;
+};
+
+// 三条互相独立的判据，谁先成立听谁的。final = true 是 flushEncoding 的
+// 兜底路径，此时用更宽松的 CJK 配对下限。
+static EncVerdict judgeEncoding(const unsigned char* b, int n, bool final) {
+    EncVerdict v;
+    v.enc = ENC_UTF8;
+    v.skip = 0;
+    v.decided = false;
+
+    if (n >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
+        v.enc = ENC_UTF16LE; v.skip = 2; v.decided = true; return v;
+    }
+    if (n >= 2 && b[0] == 0xFE && b[1] == 0xFF) {
+        v.enc = ENC_UTF16BE; v.skip = 2; v.decided = true; return v;
+    }
+    if (n < 4) return v;
+
+    // 判据一：奇数位多数是 0x00。UTF-16LE 的 ASCII 段里每个字符后面都跟一个
+    // 0x00（"(c)" = 28 00 63 00 29 00），而 UTF-8 正文除 NUL 外不会出现 0x00。
+    // wsl.exe 的输出是「ASCII 版权声明 + 中文」混排，汉字码元的高字节不为 0，
+    // 所以只能要求「多数」而不是「全部」——要求全部的话，探测窗口一旦填满到
+    // 混进汉字字节就会失效，同一份数据分片喂和一次性喂会得出不同结论。
+    //
+    // 阈值 3/4：纯 ASCII 的 UTF-16 里是 100%，中英混排的 UTF-16 里 ASCII 段
+    // 通常占一半以上；而 UTF-8 流里奇数位落到 0x00 的概率约1/256，远低于阈值。
+    int oddSlots = 0, oddZero = 0;
+    for (int i = 1; i < n; i += 2) {
+        ++oddSlots;
+        if (b[i] == 0x00) ++oddZero;
+    }
+    if (oddSlots >= 4 && oddZero * 4 >= oddSlots * 3) {
+        v.enc = ENC_UTF16LE; v.decided = true; return v;
+    }
+    // 样本很少时（「AB」= 41 00 42 00）只要奇数位全零也认，仍是可靠证据。
+    if (oddSlots > 0 && oddSlots <= 3 && oddZero == oddSlots) {
+        v.enc = ENC_UTF16LE; v.decided = true; return v;
+    }
+
+    // 判据二：UTF-8 结构。非法就是 UTF-16；合法且带多字节序列就是 UTF-8。
+    int seqs = 0;
+    if (scanUtf8(b, n, &seqs) != 0) { v.enc = ENC_UTF16LE; v.decided = true; return v; }
+    if (seqs >= 1)                 { v.enc = ENC_UTF8;    v.decided = true; return v; }
+
+    // 判据三：逐字节都像 ASCII（纯中文的 UTF-16 就是这个样子），此时只有
+    // 每一对码元都是 CJK / 全角才认 UTF-16。
+    //
+    // 这条判据是**欠定的**：可打印 ASCII 两两配对能造出 7157 个 CJK 区码点，
+    // 占 U+4E00..U+9FFF 整段的 22.2%，纯 ASCII 文本凑够几对就可能全中
+    // （实测 "fuhwihwefw" 40 字节凑出 20 对真汉字，hi 也都 >= 0x4E，
+    // 于是整段被当 UTF-16、每字节占两格，120 字符只剩 60）。
+    // 「按码点分布区分」走不通（试过，那 22% 同样能造出来），只能靠样本量：
+    //   - 正常路径（攒满 32 字节 = 16 对）：>= 12 对，且hi 必须 >= 0x80
+    //   - 兜底路径（flushEncoding，数据凑不满一窗）：>= 2 对即可，
+    //     改用「全流无0x00 字节」当额外证据
+    if (allStrictCjkPairs(b, n, final ? 6 : 12, final)) {
+        v.enc = ENC_UTF16LE; v.decided = true; return v;
+    }
+
+    // 攒满一窗仍分不出来：guest 侧输出几乎必然是 UTF-8，按 UTF-8 走。
+    if (n >= kProbeWindow) { v.enc = ENC_UTF8; v.decided = true; }
+    return v;
+}
+
+void Terminal::flushEncoding() {
+    // 首块数据不足一窗时判定不可靠，但也不能一直攥着不显示：guest 打个
+    // 提示符就停下等输入的时候，攒不满窗口就永远不出字。调用方在定时器里
+    // 兜底调一次，按已有字节定性（默认 UTF-8，guest shell 的常态）。
+    if (m_enc != ENC_PROBE) {
+        // 编码已定但队列里还压着字节（探测阶段判定成立那一刻就冲掉了，
+        // 这里是防御：万一有别处往队列里塞了东西，也不能留着不显示）。
+        if (!m_encBuf.empty()) {
+            std::string pending;
+            pending.swap(m_encBuf);
+            if (m_enc == ENC_UTF8) feedUtf8(pending.data(), pending.size());
+            else                    feedUtf16(pending.data(), pending.size(),
+                                               m_enc == ENC_UTF16BE);
+        }
+        return;
+    }
+    if (m_probeLen == 0 && m_encBuf.empty()) return;
+
+    EncVerdict v = judgeEncoding(m_probe, m_probeLen, true);
+    m_enc = v.enc;
+
+    std::string head((const char*)m_probe, (size_t)m_probeLen);
+    m_probeLen = 0;
+    if (v.skip > 0) head.erase(0, (size_t)v.skip);
+
+    // 探测窗口后面还压着后续批次的字节，一并冲出去，顺序不能反
+    if (!m_encBuf.empty()) {
+        head.append(m_encBuf);
+        m_encBuf.clear();
+    }
+
+    if (m_enc == ENC_UTF8) feedUtf8(head.data(), head.size());
+    else                    feedUtf16(head.data(), head.size(),
+                                       m_enc == ENC_UTF16BE);
+}
+
+void Terminal::detectEncoding(const char* data, size_t len) {
+    // 往探测窗口里凑，凑满一窗或数据用完再判。
+    //
+    // 两种情况下要把字节存起来，绝不能直接丢：
+    //  1) 窗口已满、但这一批还有剩余（while 因 m_probeLen==32 退出时data/len 非空）
+    //  2) 数据用完但还攒不够一窗、judgeEncoding 也没定论
+    // 早先这里只处理第2 种，第 1 种直接 return 掉了——真实 PTY 是分小块来的，
+    // 「窗口满但还没定论」这一档每批都会命中，于是每批都丢一段：
+    // 120 字符只留下 60 个，表现为「长行不折行、光标压在字符上、信息被吃」。
+    // m_encBuf 就是这条待解码队列。
+    while (m_probeLen < kProbeWindow && len > 0) {
+        m_probe[m_probeLen++] = (unsigned char)*data++;
+        --len;
+    }
+
+    EncVerdict v = judgeEncoding(m_probe, m_probeLen, false);
+    if (!v.decided) {
+        if (len > 0) m_encBuf.append(data, len);
+        return;
+    }
+
+    m_enc = v.enc;
+
+    // 探测阶段消费的字节要原样喂回去：BOM 只在流首出现一次，跳过是对的，
+    // 但正文那几十字节是内容，丢了会吃掉首行。
+    std::string head((const char*)m_probe, (size_t)m_probeLen);
+    m_probeLen = 0;
+    if (v.skip > 0) head.erase(0, (size_t)v.skip);
+
+    // 拼成一条完整的字节流再解一次：拆成两次调用会在中间留下半个码元，
+    // 后面那次调用开头才补上，反汇编里很难看出错位。
+    std::string pending;
+    pending.swap(m_encBuf);
+    pending.insert(0, head);
+    if (len > 0) pending.append(data, len);
+
+    if (m_enc == ENC_UTF8) feedUtf8(pending.data(), pending.size());
+    else                    feedUtf16(pending.data(), pending.size(),
+                                       m_enc == ENC_UTF16BE);
+}
+void Terminal::feedUtf16(const char* data, size_t len, bool bigEndian) {
+    if (len > 0) ++m_rev;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char b = (unsigned char)data[i];
+
+        // 码元可能被 ReadFile 切成两半，攒够两字节再解。
+        // m_encHi 是流里先到的那个字节：UTF-16LE 里它是低字节（68 00 -> 'h'，
+        // 0x0068），UTF-16BE 里它是高字节（00 68 -> 'h'）。
+        if (m_encHighByte) {
+            m_encHighByte = false;
+            uint32_t cp = bigEndian
+                ? ((uint32_t)m_encHi << 8) | b
+                : ((uint32_t)b << 8) | m_encHi;
+            processChar(cp);
+            continue;
+        }
+        m_encHi = b;
+        m_encHighByte = true;
+    }
+}
+
+void Terminal::feedUtf8(const char* data, size_t len) {
     if (len > 0) ++m_rev;
     for (size_t i = 0; i < len; ++i) {
         unsigned char b = (unsigned char)data[i];
@@ -412,6 +690,29 @@ void Terminal::feed(const char* data, size_t len) {
             m_utf8Need = 3;
         }
     }
+}
+
+void Terminal::feed(const char* data, size_t len) {
+    if (len == 0) return;
+
+    if (m_enc == ENC_PROBE) {
+        detectEncoding(data, len);
+        return;
+    }
+
+    // 编码已定但队列里还压着字节（探测阶段凑不满窗口、定不了性的那些批次）：
+    // 必须先按顺序冲出去，再喂这批新的。少了这一步，前面攒的字节会被
+    // 永久跳过，表现为「长行丢一半、光标压在字符上」。
+    if (!m_encBuf.empty()) {
+        std::string pending;
+        pending.swap(m_encBuf);
+        if (m_enc == ENC_UTF8) feedUtf8(pending.data(), pending.size());
+        else                    feedUtf16(pending.data(), pending.size(),
+                                           m_enc == ENC_UTF16BE);
+    }
+
+    if (m_enc == ENC_UTF8) feedUtf8(data, len);
+    else                    feedUtf16(data, len, m_enc == ENC_UTF16BE);
 }
 
 void Terminal::processChar(uint32_t c) {
@@ -735,17 +1036,26 @@ void Terminal::executeCSI(char fin) {
     int n2 = (np > 1 && p[1] > 0) ? p[1] : 1;
 
     switch (fin) {
-    case 'A': m_cy -= n1; clampCursor(); break;
-    case 'B': m_cy += n1; clampCursor(); break;
-    case 'C': m_cx += n1; clampCursor(); break;
-    case 'D': m_cx -= n1; clampCursor(); break;
-    case 'E': m_cy += n1; m_cx = 0; clampCursor(); break;
-    case 'F': m_cy -= n1; m_cx = 0; clampCursor(); break;
+    // 任何显式光标移动都要清掉待折行标记。xterm/VTE 都是这个语义：
+    // 待折行是「下一个字符会触发换行」这个**延迟决定**，光标一旦被显式挪动，
+    // 这个决定就作废了（用户是在编辑已有的行，不是在追加）。
+    //
+    // 不清会怎样：行填满时 emit() 末尾把 m_cx 钉在末列并置 wrapPending，
+    // 接着 readline 发一个 CSI D（左移）准备插入字符——我们把 cx 减了 1，
+    // wrapPending 却还在；下一个字符进 emit() 开头就折行，
+    // 于是内容跑到下一行、列位置错开。每按一次方向键错一格，
+    // 到最后提示符就画在了行中间（症状：zabc[root@...]# ）。
+    case 'A': m_cy -= n1; clampCursor(); m_wrapPending = false; break;
+    case 'B': m_cy += n1; clampCursor(); m_wrapPending = false; break;
+    case 'C': m_cx += n1; clampCursor(); m_wrapPending = false; break;
+    case 'D': m_cx -= n1; clampCursor(); m_wrapPending = false; break;
+    case 'E': m_cy += n1; m_cx = 0; clampCursor(); m_wrapPending = false; break;
+    case 'F': m_cy -= n1; m_cx = 0; clampCursor(); m_wrapPending = false; break;
     case 'G':
-    case '`': m_cx = n1 - 1; clampCursor(); break;
+    case '`': m_cx = n1 - 1; clampCursor(); m_wrapPending = false; break;
     case 'H':
-    case 'f': m_cy = n1 - 1; m_cx = n2 - 1; clampCursor(); break;
-    case 'd': m_cy = n1 - 1; clampCursor(); break;
+    case 'f': m_cy = n1 - 1; m_cx = n2 - 1; clampCursor(); m_wrapPending = false; break;
+    case 'd': m_cy = n1 - 1; clampCursor(); m_wrapPending = false; break;
     case 'J': eraseInDisplay(np > 0 ? p[0] : 0); break;
     case 'K': eraseInLine(np > 0 ? p[0] : 0); break;
     case 'L': insertLines(n1); break;

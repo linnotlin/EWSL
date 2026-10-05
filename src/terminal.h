@@ -52,6 +52,7 @@ public:
     Terminal(int cols, int rows);
 
     void feed(const char* data, size_t len);
+    void flushEncoding();
     void resize(int cols, int rows);
     void hardReset();
     void setLfImpliesCr(bool on) { m_lfImpliesCr = on; }
@@ -91,6 +92,9 @@ private:
     void  clampCursor();
 
     void  processChar(uint32_t c);
+    void  feedUtf8(const char* data, size_t len);
+    void  feedUtf16(const char* data, size_t len, bool bigEndian);
+    void  detectEncoding(const char* data, size_t len);
     void  emit(uint32_t cp);
     void  lineFeed();
     void  reverseIndex();
@@ -151,6 +155,18 @@ private:
 
     uint32_t m_utf8Acc;
     int      m_utf8Need;
+
+    // inbox wsl.exe 在组件被禁用 / 出错时把消息按 UTF-16LE 写进 stdout（实测
+    // 奇数位零字节占比 ~81%）。只按 UTF-8 解会把「安装 Linux 的 Windows 子系统」
+    // 变成一堆 CJK 字符里夹着拉丁字母的乱码，正是截图里的样子。首块数据先探一次
+    // 编码，之后锁定不再重复判断。
+    enum Encoding { ENC_PROBE = 0, ENC_UTF8, ENC_UTF16LE, ENC_UTF16BE };
+    int         m_enc;
+    int         m_probeLen;
+    unsigned char m_probe[32];
+    std::string m_encBuf;
+    bool        m_encHighByte;   // UTF-16 码元被 ReadFile 切断时的暂存
+    unsigned char m_encHi;
 
     std::wstring m_title;
 
