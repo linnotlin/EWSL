@@ -89,4 +89,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/EWSL.exe
-          generate_release_notes: true
+          # 不开 generate_release_notes：它会用自动生成的「**Full Changelog**: ...」
+          # 整体覆盖 body，tag 上写好的说明会被抹掉。tag 的说明本身
+          # （git tag -a -F 写的）已经够详细，这里只补一句 CHANGELOG 指路。
+          body: |
+            完整改动说明见提交记录与 [CHANGELOG.md](https://github.com/linnotlin/EWSL/blob/main/CHANGELOG.md)。
